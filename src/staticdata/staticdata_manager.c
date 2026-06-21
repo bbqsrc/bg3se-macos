@@ -7,8 +7,9 @@
 #include "staticdata_manager.h"
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/version_detect.h"
+#include "../core/symbol_resolver.h"
 #include "../strings/fixed_string.h"
-#include "../hooks/arm64_hook.h"
 #include <dobby.h>
 #include <string.h>
 #include <stdio.h>
@@ -163,8 +164,8 @@ static struct {
     // Original function pointers (for hooks)
     void* orig_feat_getfeats;
 
-    // ARM64 safe hook handles
-    ARM64HookHandle* feat_getfeats_hook;
+    // Hook target address (non-NULL once the FeatManager hook is installed)
+    void* feat_getfeats_hook;
 } g_staticdata = {0};
 
 // ============================================================================
@@ -680,51 +681,47 @@ static void* hook_GetActionResource(void* headmaster) {
 }
 
 /**
- * Install hooks for Get<T> functions.
- * Uses standard Dobby hooks (Get<T> functions are small and typically safe).
+ * Install a single Get<T> Dobby hook, resolving the target by symbol (with a
+ * version-gated hardcoded fallback). Skips cleanly if the target can't resolve,
+ * so we never hook a wrong/NULL address.
+ */
+static void install_one_get_hook(const char *name, const char *symbol,
+                                 uint64_t ghidra_fallback, void *hook_fn,
+                                 void **orig) {
+    void *target = resolve_addr(symbol, ghidra_fallback);
+    if (!target) {
+        log_message("[StaticData] %s: target unresolved — skipping hook", name);
+        return;
+    }
+    if (DobbyHook(target, hook_fn, orig) == 0) {
+        log_message("[StaticData] Installed %s hook at %p", name, target);
+    } else {
+        log_message("[StaticData] WARNING: Failed to hook %s", name);
+    }
+}
+
+/**
+ * Install hooks for Get<T> functions (resolve targets by symbol).
  */
 static void install_get_manager_hooks(void* main_binary_base) {
+    (void)main_binary_base;
     log_message("[StaticData] Installing Get<T> hooks for real manager capture...");
 
-    // Background
-    void* target = (uint8_t*)main_binary_base + OFFSET_GET_BACKGROUND;
-    if (DobbyHook(target, (void*)hook_GetBackground, (void**)&g_orig_GetBackground) == 0) {
-        log_message("[StaticData] Installed Get<BackgroundManager> hook at %p", target);
-    } else {
-        log_message("[StaticData] WARNING: Failed to hook Get<BackgroundManager>");
-    }
-
-    // Origin
-    target = (uint8_t*)main_binary_base + OFFSET_GET_ORIGIN;
-    if (DobbyHook(target, (void*)hook_GetOrigin, (void**)&g_orig_GetOrigin) == 0) {
-        log_message("[StaticData] Installed Get<OriginManager> hook at %p", target);
-    } else {
-        log_message("[StaticData] WARNING: Failed to hook Get<OriginManager>");
-    }
-
-    // Class
-    target = (uint8_t*)main_binary_base + OFFSET_GET_CLASS;
-    if (DobbyHook(target, (void*)hook_GetClass, (void**)&g_orig_GetClass) == 0) {
-        log_message("[StaticData] Installed Get<ClassDescriptions> hook at %p", target);
-    } else {
-        log_message("[StaticData] WARNING: Failed to hook Get<ClassDescriptions>");
-    }
-
-    // Progression
-    target = (uint8_t*)main_binary_base + OFFSET_GET_PROGRESSION;
-    if (DobbyHook(target, (void*)hook_GetProgression, (void**)&g_orig_GetProgression) == 0) {
-        log_message("[StaticData] Installed Get<ProgressionManager> hook at %p", target);
-    } else {
-        log_message("[StaticData] WARNING: Failed to hook Get<ProgressionManager>");
-    }
-
-    // ActionResource
-    target = (uint8_t*)main_binary_base + OFFSET_GET_ACTIONRESOURCE;
-    if (DobbyHook(target, (void*)hook_GetActionResource, (void**)&g_orig_GetActionResource) == 0) {
-        log_message("[StaticData] Installed Get<ActionResourceTypes> hook at %p", target);
-    } else {
-        log_message("[StaticData] WARNING: Failed to hook Get<ActionResourceTypes>");
-    }
+    install_one_get_hook("Get<BackgroundManager>",
+        "__ZNK2ls23ImmutableDataHeadmaster3GetIN3eoc17BackgroundManagerEEEPKT_v",
+        0x100000000ULL + OFFSET_GET_BACKGROUND, (void*)hook_GetBackground, (void**)&g_orig_GetBackground);
+    install_one_get_hook("Get<OriginManager>",
+        "__ZNK2ls23ImmutableDataHeadmaster3GetIN3eoc13OriginManagerEEEPKT_v",
+        0x100000000ULL + OFFSET_GET_ORIGIN, (void*)hook_GetOrigin, (void**)&g_orig_GetOrigin);
+    install_one_get_hook("Get<ClassDescriptions>",
+        "__ZNK2ls23ImmutableDataHeadmaster3GetIN3eoc17ClassDescriptionsEEEPKT_v",
+        0x100000000ULL + OFFSET_GET_CLASS, (void*)hook_GetClass, (void**)&g_orig_GetClass);
+    install_one_get_hook("Get<ProgressionManager>",
+        "__ZNK2ls23ImmutableDataHeadmaster3GetIN3eoc18ProgressionManagerEEEPKT_v",
+        0x100000000ULL + OFFSET_GET_PROGRESSION, (void*)hook_GetProgression, (void**)&g_orig_GetProgression);
+    install_one_get_hook("Get<ActionResourceTypes>",
+        "__ZNK2ls23ImmutableDataHeadmaster3GetIN3eoc19ActionResourceTypesEEEPKT_v",
+        0x100000000ULL + OFFSET_GET_ACTIONRESOURCE, (void*)hook_GetActionResource, (void**)&g_orig_GetActionResource);
 
     log_message("[StaticData] Get<T> hooks installation complete");
 }
@@ -967,65 +964,38 @@ int staticdata_hash_lookup_capture(void) {
 }
 
 // ============================================================================
-// ARM64 Safe Hook Installation (Issue #44)
+// FeatManager::GetFeats Hook Installation
 // ============================================================================
 
 /**
- * Install ARM64-safe hook for FeatManager::GetFeats.
- * Uses skip-and-redirect strategy to avoid ADRP corruption.
- * Returns true if hook was installed successfully.
+ * Install the FeatManager::GetFeats hook via Dobby.
+ * Dobby relocates ADRP/ADR/LDR-literal prologues correctly, so no custom
+ * skip-and-redirect is needed (the old ARM64 hook reinvented this badly).
+ * Returns true if the hook was installed successfully.
  */
-static bool install_feat_getfeats_safe_hook(void* main_binary_base) {
-    void* target = (uint8_t*)main_binary_base + OFFSET_FEAT_GETFEATS;
-
-    // First, analyze the prologue to understand the ADRP patterns
-    log_message("[StaticData] Analyzing FeatManager::GetFeats prologue at %p", target);
-    arm64_analyze_and_log(target, "FeatManager::GetFeats");
-
-    // Check if it has ADRP in prologue
-    if (arm64_has_prologue_adrp(target)) {
-        log_message("[StaticData] ADRP detected in prologue - using ARM64 safe hook");
-
-        // Get recommended hook offset
-        int safe_offset = arm64_get_recommended_hook_offset(target);
-        if (safe_offset < 0) {
-            log_message("[StaticData] WARNING: No safe hook point found, falling back to TypeContext");
-            return false;
-        }
-
-        log_message("[StaticData] Safe hook point at +%d (0x%x)", safe_offset, safe_offset);
-
-        // Install the safe hook
-        void* original = NULL;
-        g_staticdata.feat_getfeats_hook = arm64_safe_hook(target, (void*)hook_FeatGetFeats, &original);
-
-        if (g_staticdata.feat_getfeats_hook) {
-            g_orig_FeatGetFeats = (FeatGetFeats_t)original;
-            log_message("[StaticData] ARM64 safe hook installed successfully!");
-            log_message("[StaticData]   Original function trampoline: %p", original);
-            return true;
-        } else {
-            log_message("[StaticData] WARNING: ARM64 safe hook installation failed");
-            return false;
-        }
-    } else {
-        // No ADRP in prologue - safe to use standard Dobby hook!
-        log_message("[StaticData] No ADRP in prologue - installing standard Dobby hook");
-
-        void* original = NULL;
-        int result = DobbyHook(target, (void*)hook_FeatGetFeats, (void**)&original);
-
-        if (result == 0 && original) {
-            g_orig_FeatGetFeats = (FeatGetFeats_t)original;
-            g_staticdata.feat_getfeats_hook = target;
-            log_message("[StaticData] Dobby hook installed successfully!");
-            log_message("[StaticData]   Original function trampoline: %p", original);
-            return true;
-        } else {
-            log_message("[StaticData] WARNING: Dobby hook installation failed (result=%d)", result);
-            return false;
-        }
+static bool install_feat_getfeats_hook(void* main_binary_base) {
+    (void)main_binary_base;
+    // Resolve eoc::FeatManager::GetFeats() const by symbol (correct across
+    // versions); skip if unresolved so we never hook a wrong address.
+    void* target = resolve_addr("__ZNK3eoc10FeatManager8GetFeatsEv",
+                                0x100000000ULL + OFFSET_FEAT_GETFEATS);
+    if (!target) {
+        log_message("[StaticData] FeatManager::GetFeats unresolved — skipping hook");
+        return false;
     }
+
+    void* original = NULL;
+    int result = DobbyHook(target, (void*)hook_FeatGetFeats, (void**)&original);
+
+    if (result == 0 && original) {
+        g_orig_FeatGetFeats = (FeatGetFeats_t)original;
+        g_staticdata.feat_getfeats_hook = target;
+        log_message("[StaticData] FeatManager::GetFeats hook installed (trampoline %p)", original);
+        return true;
+    }
+
+    log_message("[StaticData] WARNING: FeatManager::GetFeats hook failed (result=%d)", result);
+    return false;
 }
 
 // ============================================================================
@@ -1043,19 +1013,22 @@ bool staticdata_manager_init(void *main_binary_base) {
     memset(g_staticdata.managers, 0, sizeof(g_staticdata.managers));
     memset(g_staticdata.real_managers, 0, sizeof(g_staticdata.real_managers));
 
-    // Try to install ARM64-safe hook for FeatManager::GetFeats
-    // This uses the skip-and-redirect strategy from Issue #44
-    bool hook_installed = install_feat_getfeats_safe_hook(main_binary_base);
-
-    if (hook_installed) {
-        log_message("[StaticData] FeatManager hook: ARM64 safe hook active");
+    // Main-binary code hooks: even with a symbol-correct target address, the hook
+    // *handlers* read manager structs whose field layout can differ across builds
+    // and crash. So only install them on an exact version match; on a mismatch the
+    // managers fall back to the data-capture path (no crash). Symbol resolution
+    // fixes addresses, not struct layouts.
+    if (version_detect_matches()) {
+        if (install_feat_getfeats_hook(main_binary_base)) {
+            log_message("[StaticData] FeatManager hook active");
+        } else {
+            log_message("[StaticData] FeatManager hook: using TypeContext capture (hook not installed)");
+        }
+        install_get_manager_hooks(main_binary_base);
     } else {
-        log_message("[StaticData] FeatManager hook: Using TypeContext capture (hook not installed)");
+        log_message("[StaticData] Version mismatch — skipping main-binary code hooks "
+                    "(handlers read version-specific struct layouts); data-capture fallback");
     }
-
-    // Install Get<T> hooks for other manager types (Dec 22, 2025)
-    // These capture real manager pointers from ImmutableDataHeadmaster
-    install_get_manager_hooks(main_binary_base);
 
     g_staticdata.initialized = true;
     log_message("[StaticData] Static data manager initialized");

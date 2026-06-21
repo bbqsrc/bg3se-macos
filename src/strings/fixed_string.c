@@ -13,6 +13,7 @@
 #include "fixed_string.h"
 #include "../core/logging.h"
 #include "../core/version.h"
+#include "../core/symbol_resolver.h"
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
@@ -33,6 +34,13 @@ static void **g_pGlobalStringTable = NULL;  // Pointer to GlobalStringTable*
 static void *g_MainBinaryBase = NULL;
 static bool g_Initialized = false;
 static bool g_LazyDiscoveryAttempted = false;  // For deferred heavy probing
+
+// The game's own resolver: ls::gst::Get(uint32 index) -> StringView {char* data, u32 len}.
+// On ARM64 a <=16-byte struct returns in x0:x1 (x0=data, x1=len). Using this is
+// version-independent and avoids reverse-engineering the GST SubTable layout.
+typedef struct { const char *data; uint32_t len; } GstStringView;
+typedef GstStringView (*GstGetFn)(uint32_t index);
+static GstGetFn g_gstGet = NULL;
 
 // Runtime-discovered offsets (may differ from Windows x64)
 static uint32_t g_OffsetBuckets = SUBTABLE_OFFSET_BUCKETS;
@@ -1121,8 +1129,21 @@ void fixed_string_init(void *main_binary_base) {
     g_MainBinaryBase = main_binary_base;
     LOG_CORE_DEBUG("Initializing with binary base %p", main_binary_base);
 
-    // Try dlsym first
-    g_pGlobalStringTable = try_dlsym_discovery();
+    // Preferred path: resolve the game's own accessor ls::gst::Get(uint32) and
+    // call it to resolve FixedStrings (version-independent, no layout assumptions).
+    g_gstGet = (GstGetFn)symbol_resolve("__ZN2ls3gst3GetEj");
+    if (g_gstGet) {
+        LOG_CORE_DEBUG("Resolved ls::gst::Get: %p", (void *)g_gstGet);
+    }
+
+    // Resolve ls::gst::s_Instance (the GlobalStringTable instance pointer) by
+    // symbol — used by the layout-walk fallback. Falls back to dlsym guesses.
+    g_pGlobalStringTable = (void **)symbol_resolve("__ZN2ls3gst10s_InstanceE");
+    if (g_pGlobalStringTable) {
+        LOG_CORE_DEBUG("Resolved ls::gst::s_Instance: %p", (void *)g_pGlobalStringTable);
+    } else {
+        g_pGlobalStringTable = try_dlsym_discovery();
+    }
 
     if (g_pGlobalStringTable) {
         void *gst = NULL;
@@ -1229,6 +1250,17 @@ static bool try_lazy_discovery(void) {
 const char *fixed_string_resolve(uint32_t index) {
     if (index == FS_NULL_INDEX) {
         return NULL;
+    }
+
+    // Preferred: ask the game's own resolver. Robust across versions; no GST
+    // layout assumptions. Returns a StringView; FixedString data is NUL-terminated.
+    if (g_gstGet) {
+        GstStringView sv = g_gstGet(index);
+        if (sv.data) {
+            g_ResolvedCount++;
+            return sv.data;
+        }
+        // fall through to the layout-walk fallback below
     }
 
     // Try lazy discovery if GST not found yet
@@ -1409,21 +1441,18 @@ static bool init_intern_function(void) {
     }
     g_InternInitialized = true;
 
-    if (!g_MainBinaryBase) {
-        LOG_CORE_WARN("Cannot init FixedString::Create - binary base not set");
+    // Resolve ls::FixedString::Create(char const*, int) by symbol — the ABI is
+    // void(uint32_t* out, const char* str, int len). resolve_addr returns NULL on
+    // a version mismatch without a symbol, so we never call a wrong address (which
+    // would crash); intern is simply disabled in that case.
+    g_FixedStringCreate = (FixedStringCreate_t)resolve_addr(
+        "__ZN2ls11FixedString6CreateEPKci", GHIDRA_FIXEDSTRING_CREATE);
+    if (!g_FixedStringCreate) {
+        LOG_CORE_WARN("FixedString::Create unresolved — interning disabled");
         return false;
     }
 
-    // Calculate runtime address from Ghidra offset
-    uintptr_t runtime_addr = (uintptr_t)g_MainBinaryBase +
-                              (GHIDRA_FIXEDSTRING_CREATE - GHIDRA_BASE_ADDRESS);
-
-    g_FixedStringCreate = (FixedStringCreate_t)runtime_addr;
-
-    LOG_CORE_DEBUG("Resolved FixedString::Create at %p (Ghidra 0x%llx)",
-               (void *)g_FixedStringCreate,
-               (unsigned long long)GHIDRA_FIXEDSTRING_CREATE);
-
+    LOG_CORE_DEBUG("Resolved FixedString::Create: %p", (void *)g_FixedStringCreate);
     return true;
 }
 

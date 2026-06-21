@@ -9,7 +9,6 @@
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
 #include "../strings/fixed_string.h"
-#include "../hooks/arm64_hook.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,55 +148,6 @@ static void* hook_CacheTemplate(void* cache_mgr, void* tmpl, void* fs1, void* fs
         return g_orig_CacheTemplate(cache_mgr, tmpl, fs1, fs2);
     }
     return NULL;
-}
-
-/**
- * Install a single ARM64-safe hook with ADRP detection.
- * Returns true if hook was installed successfully.
- */
-static bool install_arm64_safe_hook(const char* name, void* target, void* hook_fn, void** orig_out) {
-    log_message("[Template] Analyzing %s prologue at %p", name, target);
-    arm64_analyze_and_log(target, name);
-
-    if (arm64_has_prologue_adrp(target)) {
-        log_message("[Template] ADRP detected in %s prologue - using ARM64 safe hook", name);
-
-        int safe_offset = arm64_get_recommended_hook_offset(target);
-        if (safe_offset < 0) {
-            log_message("[Template] WARNING: No safe hook point found for %s", name);
-            return false;
-        }
-
-        log_message("[Template] Safe hook point for %s at +%d (0x%x)", name, safe_offset, safe_offset);
-
-        void* original = NULL;
-        void* hook_addr = arm64_safe_hook(target, hook_fn, &original);
-
-        if (hook_addr && original) {
-            *orig_out = original;
-            log_message("[Template] ARM64 safe hook installed for %s!", name);
-            log_message("[Template]   Original function trampoline: %p", original);
-            return true;
-        } else {
-            log_message("[Template] WARNING: ARM64 safe hook failed for %s", name);
-            return false;
-        }
-    } else {
-        log_message("[Template] No ADRP in %s prologue - installing standard Dobby hook", name);
-
-        void* original = NULL;
-        int result = DobbyHook(target, hook_fn, (void**)&original);
-
-        if (result == 0 && original) {
-            *orig_out = original;
-            log_message("[Template] Dobby hook installed for %s at %p", name, target);
-            log_message("[Template]   Original function trampoline: %p", original);
-            return true;
-        } else {
-            log_message("[Template] WARNING: Dobby hook failed for %s (result=%d)", name, result);
-            return false;
-        }
-    }
 }
 
 /**

@@ -23,6 +23,7 @@
 #include "network_backend.h"
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/version_detect.h"    // version_detect_matches()
 #include "../game/game_state.h"        // game_state_get_current()
 #include "../entity/entity_system.h"   // entity_get_binary_base(), entity_get_eoc_server()
 #include <dobby.h>
@@ -390,6 +391,14 @@ bool net_hooks_register_message(void) {
     if (s_status.message_factory_hooked) {
         LOG_NET_INFO("net_hooks_register_message: already hooked, skipping");
         return true;
+    }
+
+    // GetMessage is patched at a hardcoded offset, so only hook it on an exact
+    // version match — a drifted offset would corrupt unrelated code. On mismatch
+    // the custom net channel is unavailable (graceful degradation).
+    if (!version_detect_matches()) {
+        LOG_NET_INFO("net_hooks_register_message: version mismatch — skipping GetMessage hook");
+        return false;
     }
 
     if (!s_net_msg_factory) {

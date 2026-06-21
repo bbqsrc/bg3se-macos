@@ -20,6 +20,7 @@
 #include "localization.h"
 #include "logging.h"
 #include "fixed_string.h"
+#include "../core/symbol_resolver.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -133,13 +134,15 @@ void localization_init(void *main_binary_base) {
 
     s_loca.binary_base = main_binary_base;
 
-    // Calculate address of ls::TranslatedStringRepository::m_ptr
-    s_loca.repo_ptr_addr = (void**)((uintptr_t)main_binary_base + LOCA_REPO_OFFSET);
-
-    // Calculate function addresses
-    s_loca.fs_create = (FixedStringCreateFn)((uintptr_t)main_binary_base + LOCA_FIXEDSTRING_CREATE);
-    s_loca.tryget_fn = (void*)((uintptr_t)main_binary_base + LOCA_TRYGET_OFFSET);
-    s_loca.add_string_fn = (AddTranslatedStringFn)((uintptr_t)main_binary_base + LOCA_ADDTRANSLATEDSTRING);
+    // Resolve by symbol (version-independent). Called function pointers without a
+    // symbol resolve to NULL on a version mismatch (callers null-check before use),
+    // so we never call a wrong address.
+    s_loca.repo_ptr_addr = (void**)resolve_addr(
+        "__ZN2ls26TranslatedStringRepository5m_ptrE", 0x100000000ULL + LOCA_REPO_OFFSET);
+    s_loca.fs_create = (FixedStringCreateFn)resolve_addr(
+        "__ZN2ls11FixedString6CreateEPKci", 0x100000000ULL + LOCA_FIXEDSTRING_CREATE);
+    s_loca.tryget_fn = (void*)resolve_addr(NULL, 0x100000000ULL + LOCA_TRYGET_OFFSET);
+    s_loca.add_string_fn = (AddTranslatedStringFn)resolve_addr(NULL, 0x100000000ULL + LOCA_ADDTRANSLATEDSTRING);
 
     LOG_CORE_INFO("LOCA: Initialized - repo_ptr at %p", (void*)s_loca.repo_ptr_addr);
     LOG_CORE_DEBUG("LOCA: FixedString::Create at %p", (void*)s_loca.fs_create);

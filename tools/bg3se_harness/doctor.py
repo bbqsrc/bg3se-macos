@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -36,6 +38,27 @@ def _check(name, passed, detail=None, fix=None):
     return result
 
 
+def _bundle_version():
+    """Read CFBundleShortVersionString from the detected BG3 bundle, or None."""
+    plist = BG3_APP_BUNDLE / "Contents/Info.plist"
+    try:
+        with open(plist, "rb") as f:
+            data = plistlib.load(f)
+        return data.get("CFBundleShortVersionString") or data.get("CFBundleVersion")
+    except (OSError, plistlib.InvalidFileException):
+        return None
+
+
+def _known_good_version():
+    """Parse BG3_KNOWN_VERSION from src/core/version_detect.h (single source)."""
+    header = PROJECT_ROOT / "src/core/version_detect.h"
+    try:
+        m = re.search(r'#define\s+BG3_KNOWN_VERSION\s+"([^"]+)"', header.read_text())
+        return m.group(1) if m else None
+    except OSError:
+        return None
+
+
 def run_doctor():
     """Run all diagnostic checks. Returns dict with checks array and summary."""
     checks = []
@@ -45,7 +68,7 @@ def run_doctor():
         "bg3_app_bundle",
         BG3_APP_BUNDLE.exists(),
         detail=str(BG3_APP_BUNDLE),
-        fix="Install BG3 via Steam",
+        fix="Install BG3 (Steam or GOG), or set $BG3SE_APP_BUNDLE to its path",
     ))
 
     # 2. BG3 binary
@@ -53,6 +76,37 @@ def run_doctor():
         "bg3_binary",
         BG3_EXEC.exists(),
         detail=str(BG3_EXEC),
+    ))
+
+    # 2b. Game version vs. the offsets' known-good build. A newer build (any
+    # store) doesn't fail — version_detect gracefully gates address-baked
+    # features — but we surface the delta so it's not a surprise in-game.
+    detected = _bundle_version()
+    known = _known_good_version()
+    if detected and known:
+        if detected == known:
+            ver_passed, ver_detail = True, f"{detected} (matches known-good)"
+        elif detected.split(".")[:3] == known.split(".")[:3]:
+            ver_passed = True
+            ver_detail = (
+                f"{detected} — newer build than known-good {known}; "
+                "address-baked features (Stats, prototype managers) may degrade"
+            )
+        else:
+            ver_passed = False
+            ver_detail = (
+                f"{detected} differs from known-good {known}; "
+                "address-dependent features likely disabled"
+            )
+    else:
+        ver_passed = False
+        ver_detail = f"detected={detected or '?'} known-good={known or '?'}"
+    checks.append(_check(
+        "game_version",
+        ver_passed,
+        detail=ver_detail,
+        fix="Offsets were verified for the known-good build; newer patches may "
+            "need offset updates for full feature coverage",
     ))
 
     # 3. SE dylib built
@@ -80,7 +134,8 @@ def run_doctor():
     checks.append(_check(
         "binary_patched",
         patched,
-        fix="Run: bg3se-harness patch",
+        fix="Run: bg3se-harness patch — or use 'launch --inject dyld' to skip "
+            "patching (GOG/non-Steam installs without Hardened Runtime)",
     ))
 
     # 6. insert_dylib available

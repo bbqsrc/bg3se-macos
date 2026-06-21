@@ -15,6 +15,7 @@
 #include "audio_manager.h"
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/symbol_resolver.h"
 #include "../strings/fixed_string.h"
 #include <stdlib.h>
 #include <string.h>
@@ -116,10 +117,13 @@ bool audio_manager_init(void *main_binary_base) {
     }
 
     g_audio.main_binary_base = main_binary_base;
-    g_audio.resource_manager_ptr = (void **)((uintptr_t)main_binary_base + OFFSET_RESOURCEMANAGER_PTR);
-
-    // Resolve ls::STDString constructor for PlayExternalSound path parameter
-    g_audio.stdstring_ctor = (STDStringCtorFn)((uintptr_t)main_binary_base + OFFSET_STDSTRING_CTOR);
+    // Resolve by symbol (version-independent). The STDString ctor is a CALL site,
+    // so resolve_addr returns NULL on a version mismatch without a symbol — the
+    // PlayExternalSound path checks for NULL before calling (never a wrong address).
+    g_audio.resource_manager_ptr = (void **)resolve_addr(
+        "__ZN2ls15ResourceManager5m_ptrE", 0x100000000ULL + OFFSET_RESOURCEMANAGER_PTR);
+    g_audio.stdstring_ctor = (STDStringCtorFn)resolve_addr(
+        "__ZN2ls9STDStringC1EPKc", 0x100000000ULL + OFFSET_STDSTRING_CTOR);
 
     log_message("[Audio] Audio manager initialized");
     log_message("[Audio]   Base: %p", main_binary_base);

@@ -121,6 +121,7 @@ def _launch_until_socket(
     auto_dismiss=True,
     retries=0,
     retry_delay=3.0,
+    inject="patch",
 ):
     attempts = []
     max_attempts = retries + 1
@@ -138,6 +139,7 @@ def _launch_until_socket(
             skip_videos=skip_videos,
             auto_dismiss=auto_dismiss,
             headless=headless,
+            inject=inject,
         )
 
         print("Waiting for SE socket...", file=sys.stderr)
@@ -228,6 +230,10 @@ def _add_launch_flags(parser):
                     help="Skip save-load mod state preflight")
     g.add_argument("--accept-mod-verification", action="store_true",
                     help="Debug only: allow launch even when preflight expects BG3 Mod Verification")
+    g.add_argument("--inject", choices=["patch", "dyld"], default="patch",
+                    help="Dylib injection method: 'patch' (default, edits+re-signs the "
+                         "game binary) or 'dyld' (DYLD_INSERT_LIBRARIES, no binary "
+                         "patch — for non-Steam/GOG installs without Hardened Runtime)")
 
 
 def _run_mod_preflight_if_needed(args, *, continue_game, load_save):
@@ -308,7 +314,9 @@ def cmd_launch(args):
         print(json.dumps(preflight, indent=2))
         return 1
 
-    # Build + deploy
+    inject = getattr(args, "inject", "patch")
+
+    # Build (deploy + patch only in patch mode; dyld mode loads from build/lib)
     print("Building...", file=sys.stderr)
     br = build_mod.build()
     if not br.get("success"):
@@ -316,17 +324,24 @@ def cmd_launch(args):
         return 1
 
     verify = build_mod.verify()
-    deploy = build_mod.deploy()
-    if not verify.get("verified") or not deploy.get("deployed"):
-        print(json.dumps({"stage": "deploy", "verify": verify, "deploy": deploy}, indent=2))
+    if not verify.get("verified"):
+        print(json.dumps({"stage": "build", "verify": verify}, indent=2))
         return 1
 
-    # Patch
-    print("Patching...", file=sys.stderr)
-    pr = patch_mod.patch()
-    if not (pr.get("success") or pr.get("already_patched")):
-        print(json.dumps({"stage": "patch", **pr}, indent=2))
-        return 1
+    if inject == "patch":
+        deploy = build_mod.deploy()
+        if not deploy.get("deployed"):
+            print(json.dumps({"stage": "deploy", "verify": verify, "deploy": deploy}, indent=2))
+            return 1
+
+        print("Patching...", file=sys.stderr)
+        pr = patch_mod.patch()
+        if not (pr.get("success") or pr.get("already_patched")):
+            print(json.dumps({"stage": "patch", **pr}, indent=2))
+            return 1
+    else:
+        print("Injecting via DYLD_INSERT_LIBRARIES (no binary patch)...", file=sys.stderr)
+        pr = {"skipped": True, "reason": "dyld injection", "inject": "dyld"}
 
     # Launch with game flags
     skip_videos = getattr(args, "skip_videos", True)
@@ -345,6 +360,7 @@ def cmd_launch(args):
             skip_videos=skip_videos,
             auto_dismiss=auto_dismiss,
             headless=headless,
+            inject=inject,
         )
         import subprocess as _sp
         _sp.Popen(
@@ -379,6 +395,7 @@ def cmd_launch(args):
         auto_dismiss=auto_dismiss,
         retries=retries,
         retry_delay=_retry_delay(args),
+        inject=inject,
     )
 
     health["patch"] = pr
@@ -430,7 +447,9 @@ def cmd_test(args):
         print(json.dumps(preflight, indent=2))
         return 1
 
-    # Build + deploy
+    inject = getattr(args, "inject", "patch")
+
+    # Build (deploy + patch only in patch mode; dyld mode loads from build/lib)
     print("Building...", file=sys.stderr)
     br = build_mod.build()
     if not br.get("success"):
@@ -438,17 +457,24 @@ def cmd_test(args):
         return 1
 
     verify = build_mod.verify()
-    deploy = build_mod.deploy()
-    if not verify.get("verified") or not deploy.get("deployed"):
-        print(json.dumps({"stage": "deploy", "verify": verify, "deploy": deploy}, indent=2))
+    if not verify.get("verified"):
+        print(json.dumps({"stage": "build", "verify": verify}, indent=2))
         return 1
 
-    # Patch
-    print("Patching...", file=sys.stderr)
-    pr = patch_mod.patch()
-    if not (pr.get("success") or pr.get("already_patched")):
-        print(json.dumps({"stage": "patch", **pr}, indent=2))
-        return 1
+    if inject == "patch":
+        deploy = build_mod.deploy()
+        if not deploy.get("deployed"):
+            print(json.dumps({"stage": "deploy", "verify": verify, "deploy": deploy}, indent=2))
+            return 1
+
+        print("Patching...", file=sys.stderr)
+        pr = patch_mod.patch()
+        if not (pr.get("success") or pr.get("already_patched")):
+            print(json.dumps({"stage": "patch", **pr}, indent=2))
+            return 1
+    else:
+        print("Injecting via DYLD_INSERT_LIBRARIES (no binary patch)...", file=sys.stderr)
+        pr = {"skipped": True, "reason": "dyld injection", "inject": "dyld"}
 
     # Launch
     skip_videos = getattr(args, "skip_videos", True)
@@ -466,6 +492,7 @@ def cmd_test(args):
         timeout=timeout,
         retries=retries,
         retry_delay=_retry_delay(args),
+        inject=inject,
     )
     if not health.get("socket_connected"):
         health["stage"] = health.get("stage", "health")

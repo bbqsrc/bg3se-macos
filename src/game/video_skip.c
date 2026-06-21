@@ -1,6 +1,8 @@
 #include "video_skip.h"
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/symbol_resolver.h"
+#include "../core/version_detect.h"
 #include <dobby.h>
 #include <mach-o/dyld.h>
 #include <stdlib.h>
@@ -88,14 +90,23 @@ bool video_skip_init(void *binary_base) {
         return true;
     }
 
+    (void)binary_base;
+    // Only hook on an exact version match: the symbol gives a correct address, but
+    // intercepting Bink during boot has proven destabilising on mismatched builds.
+    // On mismatch the intro simply plays.
+    if (!version_detect_matches()) {
+        LOG_CORE_INFO("[VideoSkip] Version mismatch — skipping LoadVideo hook (intro will play)");
+        return true;
+    }
+    void *target = resolve_addr("__ZN3bik11BinkManager9LoadVideoERKN2ls4PathE",
+                                VA_BINK_LOAD_VIDEO);
+    if (!target) {
+        LOG_CORE_INFO("[VideoSkip] LoadVideo unresolved — skipping hook (intro will play)");
+        return true;
+    }
+
     s_skip_enabled = true;
-
-    uintptr_t base = (uintptr_t)binary_base;
-    uintptr_t slide = base - 0x100000000ULL;
-    void *target = (void *)(VA_BINK_LOAD_VIDEO + slide);
-
-    LOG_CORE_INFO("[VideoSkip] Hooking BinkManager::LoadVideo at %p (slide=0x%lx)",
-                  target, (unsigned long)slide);
+    LOG_CORE_INFO("[VideoSkip] Hooking BinkManager::LoadVideo at %p", target);
 
     int result = DobbyHook(target, (void *)fake_BinkLoadVideo, (void **)&orig_BinkLoadVideo);
     if (result != 0) {

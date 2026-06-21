@@ -7,6 +7,7 @@
 #include "resource_manager.h"
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/symbol_resolver.h"
 #include "../strings/fixed_string.h"
 #include <string.h>
 #include <strings.h>
@@ -102,8 +103,9 @@ bool resource_manager_init(void *main_binary_base) {
 
     g_resource.main_binary_base = main_binary_base;
 
-    // Calculate runtime address of ResourceManager global pointer
-    g_resource.resource_manager_ptr = (void**)((uintptr_t)main_binary_base + OFFSET_RESOURCEMANAGER_PTR);
+    // Resolve ls::ResourceManager::m_ptr by symbol (version-independent).
+    g_resource.resource_manager_ptr = (void**)resolve_addr(
+        "__ZN2ls15ResourceManager5m_ptrE", 0x100000000ULL + OFFSET_RESOURCEMANAGER_PTR);
 
     log_message("[Resource] Resource manager initialized");
     log_message("[Resource]   Base: %p", main_binary_base);

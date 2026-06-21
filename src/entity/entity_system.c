@@ -14,6 +14,7 @@
 #include "arm64_call.h"
 #include "logging.h"
 #include "../core/version_detect.h"
+#include "../core/symbol_resolver.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -459,10 +460,14 @@ static void *read_eocserver_from_global(void) {
         return NULL;
     }
 
-    // Calculate runtime address of esv::EocServer::m_ptr
-    uintptr_t ghidra_base = GHIDRA_BASE_ADDRESS;
-    uintptr_t actual_base = (uintptr_t)g_MainBinaryBase;
-    uintptr_t global_addr = OFFSET_EOCSERVER_SINGLETON_PTR - ghidra_base + actual_base;
+    // Resolve esv::EocServer::m_ptr by symbol (version-independent), falling back
+    // to the hardcoded Ghidra address on an exact version match.
+    uintptr_t global_addr = (uintptr_t)resolve_addr("__ZN3esv9EocServer5m_ptrE",
+                                                    OFFSET_EOCSERVER_SINGLETON_PTR);
+    if (!global_addr) {
+        LOG_ENTITY_DEBUG("EoCServer::m_ptr unresolved");
+        return NULL;
+    }
 
     LOG_ENTITY_DEBUG("Reading EoCServer from global at 0x%llx", (unsigned long long)global_addr);
     LOG_ENTITY_DEBUG("  (Ghidra offset: 0x%llx, base: %p)",
@@ -538,10 +543,14 @@ static void *read_eocclient_from_global(void) {
         return NULL;
     }
 
-    // Calculate runtime address of ecl::EocClient::m_ptr
-    uintptr_t ghidra_base = GHIDRA_BASE_ADDRESS;
-    uintptr_t actual_base = (uintptr_t)g_MainBinaryBase;
-    uintptr_t global_addr = OFFSET_EOCCLIENT_SINGLETON_PTR - ghidra_base + actual_base;
+    // Resolve ecl::EocClient::m_ptr by symbol (version-independent), falling back
+    // to the hardcoded Ghidra address on an exact version match.
+    uintptr_t global_addr = (uintptr_t)resolve_addr("__ZN3ecl9EocClient5m_ptrE",
+                                                    OFFSET_EOCCLIENT_SINGLETON_PTR);
+    if (!global_addr) {
+        LOG_ENTITY_DEBUG("EoCClient::m_ptr unresolved");
+        return NULL;
+    }
 
     LOG_ENTITY_DEBUG("Reading EoCClient from global at 0x%llx", (unsigned long long)global_addr);
 

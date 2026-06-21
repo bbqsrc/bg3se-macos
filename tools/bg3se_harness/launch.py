@@ -13,8 +13,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .config import (
-    BG3_EXEC, GRAPHIC_SETTINGS_PATH, HEALTH_TIMEOUT, HEALTH_TIMEOUT_CONTINUE,
-    HARNESS_CONFIG_DIR, HEALTH_FILE, PID_FILE, PROJECT_ROOT, SOCKET_PATH,
+    BG3_EXEC, DYLIB_OUTPUT, GRAPHIC_SETTINGS_PATH, HEALTH_TIMEOUT,
+    HEALTH_TIMEOUT_CONTINUE, HARNESS_CONFIG_DIR, HEALTH_FILE, PID_FILE,
+    PROJECT_ROOT, SOCKET_PATH,
 )
 from .flags import build_flag_args
 
@@ -384,7 +385,7 @@ def restore_headless_graphics(reason=""):
 
 
 def launch(continue_game=False, load_save=None, extra_flags=None,
-           skip_videos=True, auto_dismiss=True, headless=False):
+           skip_videos=True, auto_dismiss=True, headless=False, inject="patch"):
     kill_existing(force_all=True)
     clean_socket()
     ensure_no_launcher()
@@ -401,7 +402,22 @@ def launch(continue_game=False, load_save=None, extra_flags=None,
     if skip_videos:
         ensure_skip_videos()
 
-    cmd = ["arch", "-arm64", str(BG3_EXEC)]
+    if inject == "dyld":
+        # No binary patch: load the dylib via DYLD_INSERT_LIBRARIES instead.
+        # Works on installs without Hardened Runtime / library validation (e.g.
+        # GOG launched directly). `arch -e` injects the var into the game's own
+        # spawn — `arch` itself is a platform binary so dyld would strip an
+        # inherited DYLD_* var, but -e sets it on the (unrestricted) child, and
+        # -arm64 still applies to the game (unlike piping through `env`, which
+        # leaves the game to default to Rosetta/x86_64).
+        if not DYLIB_OUTPUT.exists():
+            raise FileNotFoundError(
+                f"dyld injection needs a built dylib at {DYLIB_OUTPUT} — run the build first"
+            )
+        cmd = ["arch", "-arm64", "-e",
+               f"DYLD_INSERT_LIBRARIES={DYLIB_OUTPUT}", str(BG3_EXEC)]
+    else:
+        cmd = ["arch", "-arm64", str(BG3_EXEC)]
 
     if continue_game:
         cmd.append("-continueGame")

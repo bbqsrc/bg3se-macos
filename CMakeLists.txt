@@ -150,6 +150,7 @@ add_library(bg3se SHARED
     src/core/safe_memory.c
     src/core/crashlog.c
     src/core/version_detect.c
+    src/core/symbol_resolver.c
     src/core/mach_exception.c
     src/core/mach_exc_stubs/mach_excServer.c
     src/lua/lua_ext.c
@@ -219,8 +220,6 @@ add_library(bg3se SHARED
     src/network/extender_protocol.c
     src/network/extender_message.c
     src/network/net_hooks.c
-    src/hooks/arm64_decode.c
-    src/hooks/arm64_hook.c
     src/io/path_override.c
     src/level/level_manager.c
     src/lua/lua_level.c

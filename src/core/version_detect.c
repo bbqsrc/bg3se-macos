@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <mach/mach.h>
+#include <mach-o/dyld.h>  // _NSGetExecutablePath
 
 // ============================================================================
 // Constants
@@ -96,17 +98,50 @@ static bool plist_extract_string(const char *plist_path, const char *key,
 }
 
 // ============================================================================
-// Steam App Path Detection
+// Game App Path Detection
 // ============================================================================
 
 /**
- * Find the BG3 app bundle path via Steam's common install location.
+ * Find the BG3 app bundle path.
+ *
+ * Primary: derive it from the running executable. Because this dylib is loaded
+ * inside the game process (@loader_path/libbg3se.dylib), the main executable is
+ * <bundle>/Contents/MacOS/Baldur's Gate 3 — so the bundle is knowable with zero
+ * hardcoding, regardless of store (Steam, GOG, /Applications, anywhere).
+ *
+ * Fallback: the legacy Steam install location, for any future non-injected
+ * caller (there are none today).
  */
 static const char *find_bg3_app_path(void) {
     static char path[1024] = {0};
     if (path[0]) return path;
 
-    // Standard Steam install location
+    // Primary: derive the .app bundle from the running executable's path.
+    char exec_path[1024];
+    uint32_t exec_size = sizeof(exec_path);
+    if (_NSGetExecutablePath(exec_path, &exec_size) == 0) {
+        char resolved[1024];
+        const char *src = realpath(exec_path, resolved) ? resolved : exec_path;
+
+        // Strip the trailing "/Contents/MacOS/<exe>" to get the .app bundle root.
+        const char *marker = strstr(src, "/Contents/MacOS/");
+        if (marker) {
+            size_t len = (size_t)(marker - src);
+            if (len > 0 && len < sizeof(path)) {
+                memcpy(path, src, len);
+                path[len] = '\0';
+
+                char plist_check[1280];
+                snprintf(plist_check, sizeof(plist_check),
+                         "%s/Contents/Info.plist", path);
+                FILE *f = fopen(plist_check, "r");
+                if (f) { fclose(f); return path; }
+                path[0] = '\0';  // bundle didn't validate; fall through
+            }
+        }
+    }
+
+    // Fallback: standard Steam install location
     const char *home = getenv("HOME");
     if (!home) return NULL;
 

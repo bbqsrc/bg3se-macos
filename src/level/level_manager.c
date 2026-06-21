@@ -15,6 +15,7 @@
 #include "level_manager.h"
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/symbol_resolver.h"
 #include <string.h>
 
 // ============================================================================
@@ -76,7 +77,10 @@ bool level_manager_init(void *main_binary_base) {
     }
 
     g_level.main_binary_base = main_binary_base;
-    g_level.level_manager_ptr = (void **)((uintptr_t)main_binary_base + OFFSET_LEVEL_MANAGER_PTR);
+    // Resolve esv::LevelManager::m_ptr by symbol (server context); fall back to
+    // the hardcoded offset on an exact version match.
+    g_level.level_manager_ptr = (void **)resolve_addr(
+        "__ZN3esv12LevelManager5m_ptrE", 0x100000000ULL + OFFSET_LEVEL_MANAGER_PTR);
 
     log_message("[Level] Level manager initialized");
     log_message("[Level]   Base: %p", main_binary_base);

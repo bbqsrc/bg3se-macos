@@ -16,6 +16,7 @@
 #include "prototype_managers.h"
 #include "logging.h"
 #include "../strings/fixed_string.h"
+#include "../core/symbol_resolver.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -271,26 +272,14 @@ void stats_manager_init(void *main_binary_base) {
     // Initialize FixedString resolution system
     fixed_string_init(main_binary_base);
 
-    // Try to resolve RPGStats::m_ptr via dlsym
-    // The symbol is exported in the main binary's symbol table
-    void *handle = dlopen(NULL, RTLD_NOW);  // Get handle to main executable
-    if (handle) {
-        g_pRPGStatsPtr = (void**)dlsym(handle, RPGSTATS_M_PTR_SYMBOL);
-        if (g_pRPGStatsPtr) {
-            LOG_STATS_DEBUG("Resolved %s via dlsym: %p", RPGSTATS_M_PTR_SYMBOL, (void*)g_pRPGStatsPtr);
-        } else {
-            LOG_STATS_DEBUG("dlsym failed for %s: %s", RPGSTATS_M_PTR_SYMBOL, dlerror());
-        }
-    }
-
-    // Fallback: Calculate from Ghidra offset
-    if (!g_pRPGStatsPtr && main_binary_base) {
-        uintptr_t runtime_addr = (uintptr_t)main_binary_base +
-                                  (OFFSET_RPGSTATS_M_PTR - GHIDRA_BASE_ADDRESS);
-        g_pRPGStatsPtr = (void**)runtime_addr;
-        LOG_STATS_DEBUG("Using Ghidra offset: %p (base %p + offset 0x%llx)",
-                  (void*)g_pRPGStatsPtr, main_binary_base,
-                  (unsigned long long)(OFFSET_RPGSTATS_M_PTR - GHIDRA_BASE_ADDRESS));
+    // Resolve RPGStats::m_ptr by symbol (version-independent); falls back to the
+    // hardcoded Ghidra address only on an exact version match. dlsym alone can't
+    // find it — the symbol is local, not exported.
+    g_pRPGStatsPtr = (void**)resolve_addr(RPGSTATS_M_PTR_SYMBOL, OFFSET_RPGSTATS_M_PTR);
+    if (g_pRPGStatsPtr) {
+        LOG_STATS_DEBUG("Resolved RPGStats::m_ptr: %p", (void*)g_pRPGStatsPtr);
+    } else {
+        LOG_STATS_DEBUG("RPGStats::m_ptr unresolved (symbol missing + version mismatch)");
     }
 
     g_Initialized = true;

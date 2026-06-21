@@ -9,6 +9,7 @@
 #include "stats_manager.h"
 #include "logging.h"
 #include "../core/version_detect.h"
+#include "../core/symbol_resolver.h"
 #include "../strings/fixed_string.h"
 
 #include <stdio.h>
@@ -166,15 +167,6 @@ static void **g_pStatusPrototypeManagerPtr = NULL;
 static SpellPrototypeInit_fn g_SpellPrototypeInit = NULL;
 
 // ============================================================================
-// Helper: Calculate runtime address from Ghidra offset
-// ============================================================================
-
-static void* ghidra_to_runtime(uint64_t ghidra_addr) {
-    if (!g_MainBinaryBase) return NULL;
-    return (void*)((uintptr_t)g_MainBinaryBase + (ghidra_addr - GHIDRA_BASE_ADDRESS));
-}
-
-// ============================================================================
 // Initialization
 // ============================================================================
 
@@ -197,43 +189,23 @@ bool prototype_managers_init(void *main_binary_base) {
         return true;
     }
 
-    // Resolve singleton pointer addresses from Ghidra offsets
+    // Resolve singleton pointers by symbol (version-independent); each falls back
+    // to its hardcoded Ghidra offset only on an exact version match.
+    // (Passive has no m_ptr symbol in the binary; it relies on the fallback.)
+    g_pPassivePrototypeManagerPtr   = (void**)resolve_addr(NULL, OFFSET_PASSIVE_PROTOTYPE_MANAGER_PTR);
+    g_pBoostPrototypeManagerPtr     = (void**)resolve_addr("__ZN3eoc21BoostPrototypeManager5m_ptrE", OFFSET_BOOST_PROTOTYPE_MANAGER_PTR);
+    g_pInterruptPrototypeManagerPtr = (void**)resolve_addr("__ZN3eoc25InterruptPrototypeManager5m_ptrE", OFFSET_INTERRUPT_PROTOTYPE_MANAGER_PTR);
+    g_pSpellPrototypeManagerPtr     = (void**)resolve_addr("__ZN3eoc21SpellPrototypeManager5m_ptrE", OFFSET_SPELL_PROTOTYPE_MANAGER_PTR);
+    g_pStatusPrototypeManagerPtr    = (void**)resolve_addr("__ZN3eoc22StatusPrototypeManager5m_ptrE", OFFSET_STATUS_PROTOTYPE_MANAGER_PTR);
+    LOG_STATS_DEBUG("[PrototypeManagers] singletons: spell=%p status=%p boost=%p interrupt=%p passive=%p",
+                    (void*)g_pSpellPrototypeManagerPtr, (void*)g_pStatusPrototypeManagerPtr,
+                    (void*)g_pBoostPrototypeManagerPtr, (void*)g_pInterruptPrototypeManagerPtr,
+                    (void*)g_pPassivePrototypeManagerPtr);
 
-    // PassivePrototypeManager
-    g_pPassivePrototypeManagerPtr = (void**)ghidra_to_runtime(OFFSET_PASSIVE_PROTOTYPE_MANAGER_PTR);
-    LOG_STATS_DEBUG("[PrototypeManagers] PassivePrototypeManager ptr addr: %p (Ghidra: 0x%llx)",
-                    (void*)g_pPassivePrototypeManagerPtr,
-                    (unsigned long long)OFFSET_PASSIVE_PROTOTYPE_MANAGER_PTR);
-
-    // BoostPrototypeManager
-    g_pBoostPrototypeManagerPtr = (void**)ghidra_to_runtime(OFFSET_BOOST_PROTOTYPE_MANAGER_PTR);
-    LOG_STATS_DEBUG("[PrototypeManagers] BoostPrototypeManager ptr addr: %p (Ghidra: 0x%llx)",
-                    (void*)g_pBoostPrototypeManagerPtr,
-                    (unsigned long long)OFFSET_BOOST_PROTOTYPE_MANAGER_PTR);
-
-    // InterruptPrototypeManager
-    g_pInterruptPrototypeManagerPtr = (void**)ghidra_to_runtime(OFFSET_INTERRUPT_PROTOTYPE_MANAGER_PTR);
-    LOG_STATS_DEBUG("[PrototypeManagers] InterruptPrototypeManager ptr addr: %p (Ghidra: 0x%llx)",
-                    (void*)g_pInterruptPrototypeManagerPtr,
-                    (unsigned long long)OFFSET_INTERRUPT_PROTOTYPE_MANAGER_PTR);
-
-    // SpellPrototypeManager - discovered via GetSpellPrototype decompilation
-    g_pSpellPrototypeManagerPtr = (void**)ghidra_to_runtime(OFFSET_SPELL_PROTOTYPE_MANAGER_PTR);
-    LOG_STATS_DEBUG("[PrototypeManagers] SpellPrototypeManager ptr addr: %p (Ghidra: 0x%llx)",
-                    (void*)g_pSpellPrototypeManagerPtr,
-                    (unsigned long long)OFFSET_SPELL_PROTOTYPE_MANAGER_PTR);
-
-    // StatusPrototypeManager - discovered via Ghidra symbol search
-    g_pStatusPrototypeManagerPtr = (void**)ghidra_to_runtime(OFFSET_STATUS_PROTOTYPE_MANAGER_PTR);
-    LOG_STATS_DEBUG("[PrototypeManagers] StatusPrototypeManager ptr addr: %p (Ghidra: 0x%llx)",
-                    (void*)g_pStatusPrototypeManagerPtr,
-                    (unsigned long long)OFFSET_STATUS_PROTOTYPE_MANAGER_PTR);
-
-    // Resolve Init function pointers
-    g_SpellPrototypeInit = (SpellPrototypeInit_fn)ghidra_to_runtime(OFFSET_SPELL_PROTOTYPE_INIT);
-    LOG_STATS_DEBUG("[PrototypeManagers] SpellPrototype::Init at: %p (Ghidra: 0x%llx)",
-                    (void*)g_SpellPrototypeInit,
-                    (unsigned long long)OFFSET_SPELL_PROTOTYPE_INIT);
+    // Resolve Init function pointer
+    g_SpellPrototypeInit = (SpellPrototypeInit_fn)resolve_addr(
+        "__ZN3eoc14SpellPrototype4InitERKN2ls11FixedStringE", OFFSET_SPELL_PROTOTYPE_INIT);
+    LOG_STATS_DEBUG("[PrototypeManagers] SpellPrototype::Init at: %p", (void*)g_SpellPrototypeInit);
 
     g_Initialized = true;
     LOG_STATS_DEBUG("[PrototypeManagers] Initialization complete");

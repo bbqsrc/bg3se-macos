@@ -1,8 +1,97 @@
+import os
+import plistlib
+import subprocess
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-BG3_APP_BUNDLE = Path.home() / "Library/Application Support/Steam/steamapps/common/Baldurs Gate 3/Baldur's Gate 3.app"
-BG3_EXEC = BG3_APP_BUNDLE / "Contents/MacOS/Baldur's Gate 3"
+
+# Steam's standard install location — also used as the not-found fallback so
+# doctor can report a sensible path.
+_STEAM_BUNDLE = (
+    Path.home()
+    / "Library/Application Support/Steam/steamapps/common/Baldurs Gate 3/Baldur's Gate 3.app"
+)
+
+
+def detect_bg3_app_bundle() -> Path:
+    """Locate the BG3 .app bundle across stores (Steam, GOG, ...).
+
+    BG3 stores all user data under ~/Documents/Larian Studios and keys off the
+    com.larian.bg3 bundle id regardless of store, so only the install location
+    differs. Returns the first existing candidate; falls back to the Steam path.
+    """
+    # 1. Explicit override for unusual installs.
+    override = os.environ.get("BG3SE_APP_BUNDLE")
+    if override:
+        return Path(override).expanduser()
+
+    home = Path.home()
+    candidates = [
+        _STEAM_BUNDLE,                                              # Steam
+        Path("/Applications/Baldur's Gate 3.app"),                 # GOG default
+        home / "Applications/Baldur's Gate 3.app",
+        home / "GOG Games/Baldur's Gate 3/Baldur's Gate 3.app",
+        home / "GOG Games/Baldurs Gate 3/Baldur's Gate 3.app",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    # 2. Last resort: ask Spotlight for the bundle by id. Skip the GOG Galaxy
+    #    launcher stub ("GOG Galaxy - Baldur's Gate 3.app"), which is not the game.
+    try:
+        out = subprocess.run(
+            ["mdfind", "kMDItemCFBundleIdentifier == 'com.larian.bg3'"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.endswith("Baldur's Gate 3.app") and "GOG Galaxy" not in line:
+                return Path(line)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    return _STEAM_BUNDLE
+
+
+def detect_bg3_executable(bundle: Path) -> Path:
+    """Locate the real game binary inside the bundle.
+
+    GOG ships a tiny launcher stub ('Baldur's Gate 3', ~200KB) that execs the
+    real game ('Baldur's Gate 3 GOG', ~480MB); on Steam the main executable IS
+    the game. Launching the launcher leaves the real game to default to Rosetta
+    (x86_64) — fatal for our arm64 offsets — so target the real binary directly.
+    Heuristic: the largest Mach-O in Contents/MacOS (launcher stubs are tiny),
+    excluding our own dylib and any patch backup. Falls back to CFBundleExecutable.
+    """
+    macos = bundle / "Contents/MacOS"
+    fallback = macos / "Baldur's Gate 3"
+    try:
+        with open(bundle / "Contents/Info.plist", "rb") as f:
+            exe = plistlib.load(f).get("CFBundleExecutable")
+        if exe:
+            fallback = macos / exe
+    except (OSError, plistlib.InvalidFileException):
+        pass
+
+    try:
+        candidates = [
+            p for p in macos.iterdir()
+            if p.is_file()
+            and p.name != "libbg3se.dylib"
+            and not p.name.endswith((".dylib", ".bg3se-original"))
+            and not p.name.startswith(".")
+        ]
+        if candidates:
+            # Largest file = the real game; the launcher stub is orders smaller.
+            return max(candidates, key=lambda p: p.stat().st_size)
+    except OSError:
+        pass
+    return fallback
+
+
+BG3_APP_BUNDLE = detect_bg3_app_bundle()
+BG3_EXEC = detect_bg3_executable(BG3_APP_BUNDLE)
 DYLIB_OUTPUT = PROJECT_ROOT / "build/lib/libbg3se.dylib"
 DEPLOYED_DYLIB = BG3_APP_BUNDLE / "Contents/MacOS/libbg3se.dylib"
 SOCKET_PATH = "/tmp/bg3se.sock"

@@ -49,6 +49,7 @@ extern "C" {
 // Core modules
 #include "version.h"
 #include "version_detect.h"
+#include "symbol_resolver.h"
 #include "logging.h"
 #include "crashlog.h"
 
@@ -3170,6 +3171,12 @@ static void install_hooks(void) {
         return;
     }
 
+    // Use near-branch trampolines: patch each hook site with a single B to a
+    // nearby veneer rather than a multi-instruction absolute branch. Smaller
+    // footprint and fewer prologue relocations — important when our dylib maps
+    // far (>128MB) from the game / libOsiris code (e.g. GOG's memory layout).
+    dobby_set_near_trampoline(true);
+
     // BG3SE_NO_HOOKS: Skip all Dobby hook installation (Issue #65 diagnostic).
     // The dylib still loads, Lua initializes, but no functions are patched.
     // This tests whether the hooks themselves cause the game to abort.
@@ -3338,6 +3345,15 @@ init_subsystems:
                 // This enables version_detect_addresses_safe() to validate
                 // addresses via vm_read even on version mismatches.
                 version_detect_set_binary_base(binary_base);
+
+                // Locate the binary's symbol table so subsystems can resolve
+                // game addresses by name (version-independent) instead of relying
+                // on hardcoded, version-specific Ghidra addresses.
+                if (symbol_resolver_init()) {
+                    LOG_CORE_INFO("Symbol resolver ready (addresses resolved by name)");
+                } else {
+                    LOG_CORE_WARN("Symbol resolver unavailable — using hardcoded offsets");
+                }
 
                 // Gate all address-dependent init behind version check.
                 // Now uses sentinel probes: if addresses are readable,
