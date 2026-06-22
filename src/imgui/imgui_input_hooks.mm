@@ -96,10 +96,11 @@ static void hooked_flagsChanged(id self, SEL _cmd, NSEvent *event) {
         default: break;
     }
 
-    imgui_metal_process_key(keycode, down, modifiers);
+    bool consumed = imgui_metal_process_key(keycode, down, modifiers);
 
-    // Always pass modifier changes to game
-    if (s_input.original_flagsChanged) {
+    // Pass modifier changes to the game only when ImGui isn't capturing keyboard,
+    // so modifiers don't drive the game while you're typing in the console.
+    if (!consumed && s_input.original_flagsChanged) {
         ((void(*)(id, SEL, NSEvent*))s_input.original_flagsChanged)(self, _cmd, event);
     }
 }
@@ -207,10 +208,10 @@ static void hooked_scrollWheel(id self, SEL _cmd, NSEvent *event) {
         dy *= 10.0f;
     }
 
-    imgui_metal_process_scroll(dx * 0.1f, dy * 0.1f);
+    bool consumed = imgui_metal_process_scroll(dx * 0.1f, dy * 0.1f);
 
-    // Always pass scroll to game (ImGui doesn't consume scroll events exclusively)
-    if (s_input.original_scrollWheel) {
+    // Pass scroll to the game only when ImGui isn't capturing the mouse.
+    if (!consumed && s_input.original_scrollWheel) {
         ((void(*)(id, SEL, NSEvent*))s_input.original_scrollWheel)(self, _cmd, event);
     }
 }

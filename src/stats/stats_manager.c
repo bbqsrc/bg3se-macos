@@ -44,20 +44,6 @@ static bool safe_read_ptr(void *addr, void **out_value) {
     return true;
 }
 
-static bool safe_read_u8(void *addr, uint8_t *out_value) {
-    if (!addr || !out_value) return false;
-
-    vm_size_t size = sizeof(uint8_t);
-    vm_offset_t data;
-    kern_return_t kr = vm_read(mach_task_self(), (vm_address_t)addr,
-                               size, &data, (mach_msg_type_number_t*)&size);
-    if (kr != KERN_SUCCESS) return false;
-
-    *out_value = *(uint8_t*)data;
-    vm_deallocate(mach_task_self(), data, size);
-    return true;
-}
-
 static bool safe_read_u32(void *addr, uint32_t *out_value) {
     if (!addr || !out_value) return false;
 
@@ -106,6 +92,25 @@ static bool safe_write_i32(void *addr, int32_t value) {
 // Ghidra offset (for fallback if dlsym fails)
 #define GHIDRA_BASE_ADDRESS 0x100000000ULL
 #define OFFSET_RPGSTATS_M_PTR 0x1089c5730ULL
+
+// Game accessors, resolved by symbol (version-independent). Calling the engine's
+// own getters avoids re-deriving struct layouts per version.
+//
+// StatsObject::GetFixedStringValue(ls::FixedString const& name) const
+//   ABI: returns `ls::FixedString const&` = pointer to a 4-byte FS index
+//   (or &FixedString::Empty on miss). Resolves name -> attribute -> pool internally.
+#define STATSOBJECT_GETFIXEDSTRINGVALUE_SYMBOL \
+    "__ZNK11StatsObject19GetFixedStringValueERKN2ls11FixedStringE"
+typedef const uint32_t *(*GetFixedStringValueFn)(const void *obj,
+                                                 const uint32_t *name_ref);
+
+// CNamedElementManager<CRPGStats_Modifier>::GetHandleByName(ls::FixedString const&) const
+//   ABI: returns int attribute handle (== IndexedProperties slot index), -1 on miss.
+//   `this` is the ModifierList pointer (its Attributes CNEM is at offset 0).
+#define MODIFIER_GETHANDLEBYNAME_SYMBOL \
+    "__ZNK20CNamedElementManagerI18CRPGStats_ModifieriLi0ELin1EE15GetHandleByNameERKN2ls11FixedStringE"
+typedef int (*ModifierGetHandleByNameFn)(const void *cnem,
+                                         const uint32_t *name_ref);
 
 // ============================================================================
 // Structure Offsets (from Windows BG3SE + ARM64 alignment)
@@ -177,7 +182,10 @@ static bool safe_write_i32(void *addr, int32_t value) {
 
 // Old offset notes (may be incorrect for ARM64):
 #define OBJECT_OFFSET_USING            0xa8   // int32_t Using (parent stat index, -1 if none)
-#define OBJECT_OFFSET_MODIFIERLIST_IDX 0x00   // uint8_t ModifierListIndex (stat type) - verified via memory dump
+// ModifierListIndex is an int32 at obj+0xE4 (confirmed via disassembly of
+// StatsObject::GetFixedStringValue on GOG 4.1.1.7209685: `ldr w8, [x0, #0xe4]`).
+// The previous value (uint8 @ 0x00) read the VMT pointer's low byte — always wrong.
+#define OBJECT_OFFSET_MODIFIERLIST_IDX 0xE4   // int32_t ModifierListIndex (stat type)
 #define OBJECT_OFFSET_LEVEL            0xb0   // uint32_t Level
 
 // FixedString structure
@@ -205,6 +213,10 @@ static bool safe_write_i32(void *addr, int32_t value) {
 static void *g_MainBinaryBase = NULL;
 static void **g_pRPGStatsPtr = NULL;   // Pointer to RPGStats::m_ptr
 static bool g_Initialized = false;
+
+// Symbol-resolved game accessors (NULL if unavailable -> falls back to layout walk).
+static GetFixedStringValueFn g_GetFixedStringValue = NULL;
+static ModifierGetHandleByNameFn g_ModifierGetHandleByName = NULL;
 
 // ============================================================================
 // Shadow Registry for Created Stats
@@ -281,6 +293,15 @@ void stats_manager_init(void *main_binary_base) {
     } else {
         LOG_STATS_DEBUG("RPGStats::m_ptr unresolved (symbol missing + version mismatch)");
     }
+
+    // Resolve property-value accessors by symbol only (no Ghidra fallback — calling
+    // a wrong address would crash; the layout-walk fallback handles a missing symbol).
+    g_GetFixedStringValue =
+        (GetFixedStringValueFn)resolve_addr(STATSOBJECT_GETFIXEDSTRINGVALUE_SYMBOL, 0);
+    g_ModifierGetHandleByName =
+        (ModifierGetHandleByNameFn)resolve_addr(MODIFIER_GETHANDLEBYNAME_SYMBOL, 0);
+    LOG_STATS_DEBUG("Resolved accessors: GetFixedStringValue=%p GetHandleByName=%p",
+                    (void*)g_GetFixedStringValue, (void*)g_ModifierGetHandleByName);
 
     g_Initialized = true;
 
@@ -519,9 +540,12 @@ static void* get_modifier_lists_manager(void) {
     return (char*)rpgstats + RPGSTATS_OFFSET_MODIFIER_LISTS;
 }
 
-// Get the ModifierValueLists manager from RPGStats
-// ModifierValueLists is the 1st CNamedElementManager (after VMT)
-// RPGStats layout: VMT(8) + ModifierValueLists(0x58) + ModifierLists(0x60) + Objects(0xC0)
+// Get the ModifierValueLists manager from RPGStats.
+// NOTE: runtime probing shows the real manager (112 value lists) is at +0x00, but
+// the per-element ValueList Name offset is not yet confirmed for GOG; reading it
+// wrong feeds garbage to gst::Get (which has no bounds check) and crashes. Until
+// the ValueList layout is derived (offset extractor), keep the safe value: the
+// type-name lookups degrade to "Unknown" instead of crashing.
 #define RPGSTATS_OFFSET_MODIFIER_VALUE_LISTS 0x08
 
 static void* get_modifier_value_lists_manager(void) {
@@ -530,18 +554,9 @@ static void* get_modifier_value_lists_manager(void) {
     return (char*)rpgstats + RPGSTATS_OFFSET_MODIFIER_VALUE_LISTS;
 }
 
-// RPGEnumeration structure offsets (ARM64)
-// struct RPGEnumeration {
-//   FixedString Name;              // +0x00 (4 bytes, padded?)
-//   LegacyMap<FixedString, int32_t> Values;
-// }
-// On ARM64 with LegacyMap, the Values map is a hash table.
-// We'll use the NameToHandle HashMap pattern from CNEM which is:
-//   HashBuf ptr(8), HashSize u32(4), pad(4), Keys ptr(8), Values ptr(8), ...
-// But RPGEnumeration.Values is a simpler flat array of {key(4), value(4)} pairs.
-//
-// For now, probe at runtime. The RPGEnumeration name is read via read_fixed_string
-// at offset 0x00. The Values map starts after the name field.
+// RPGEnumeration / CRPGStats_Modifier_ValueList structure offsets (ARM64).
+// RPGEnumeration is a simple struct { FixedString Name @ +0x00; values... }.
+// (The real type-lookup bug was the ModifierValueLists manager offset above.)
 #define RPGENUM_OFFSET_NAME 0x00
 
 // Find RPGEnumeration by name, return its pointer
@@ -943,9 +958,10 @@ const char* stats_get_type(StatsObjectPtr obj) {
         // Status names vary more, check common patterns
         if (strstr(obj_name, "_STATUS") || strstr(obj_name, "Status_")) return "StatusData";
 
-        // Try ModifierListIndex lookup as fallback
-        uint8_t modifier_list_idx = 0;
-        if (safe_read_u8((char*)obj + OBJECT_OFFSET_MODIFIERLIST_IDX, &modifier_list_idx)) {
+        // Try ModifierListIndex lookup as fallback (int32 at obj+0xE4)
+        int32_t modifier_list_idx = -1;
+        if (safe_read_i32((char*)obj + OBJECT_OFFSET_MODIFIERLIST_IDX, &modifier_list_idx) &&
+            modifier_list_idx >= 0) {
             const char *type_name = get_type_name_from_ml_index(modifier_list_idx);
             if (type_name) return type_name;
         }
@@ -1079,13 +1095,17 @@ static void* get_object_modifier_list(StatsObjectPtr obj) {
         modifier_list_idx = shadow->modifier_list_index;
         LOG_STATS_DEBUG("get_object_modifier_list: Shadow stat ModifierListIndex = %u", modifier_list_idx);
     } else {
-        // For game objects, ModifierListIndex is a uint8_t at offset 0x00
-        uint8_t ml_idx_u8 = 0;
-        if (!safe_read_u8((char*)obj + OBJECT_OFFSET_MODIFIERLIST_IDX, &ml_idx_u8)) {
+        // For game objects, ModifierListIndex is an int32 at obj+0xE4.
+        int32_t ml_idx_i32 = 0;
+        if (!safe_read_i32((char*)obj + OBJECT_OFFSET_MODIFIERLIST_IDX, &ml_idx_i32)) {
             LOG_STATS_DEBUG("get_object_modifier_list: failed to read ModifierListIndex at +0x%x", OBJECT_OFFSET_MODIFIERLIST_IDX);
             return NULL;
         }
-        modifier_list_idx = (uint32_t)ml_idx_u8;
+        if (ml_idx_i32 < 0) {
+            LOG_STATS_DEBUG("get_object_modifier_list: negative ModifierListIndex %d", ml_idx_i32);
+            return NULL;
+        }
+        modifier_list_idx = (uint32_t)ml_idx_i32;
         LOG_STATS_DEBUG("get_object_modifier_list: Game stat ModifierListIndex = %u", modifier_list_idx);
     }
 
@@ -1153,9 +1173,58 @@ static int find_property_index_by_name(void *modifier_list, const char *prop_nam
 // Property Access (Read) - Implemented via IndexedProperties
 // ============================================================================
 
+// For real (non-shadow) game stats: resolve a property name to its IndexedProperties
+// slot index by calling the engine's own GetHandleByName on the object's ModifierList.
+// Mirrors StatsObject::GetFixedStringValue exactly (ModifierListIndex @ obj+0xE4,
+// ModifierLists Values buffer @ RPGStats+0x68). Returns -1 if unavailable/not found.
+static int game_resolve_attr_index(StatsObjectPtr obj, const char *prop) {
+    if (!g_ModifierGetHandleByName || !obj || !prop) return -1;
+
+    int32_t ml_index = -1;
+    if (!safe_read_i32((char*)obj + OBJECT_OFFSET_MODIFIERLIST_IDX, &ml_index) || ml_index < 0) {
+        return -1;
+    }
+
+    void *rpgstats = stats_manager_get_raw();
+    if (!rpgstats) return -1;
+
+    void *ml_mgr = (char*)rpgstats + RPGSTATS_OFFSET_MODIFIER_LISTS;
+    uint32_t ml_count = 0;
+    if (!safe_read_u32((char*)ml_mgr + CNEM_OFFSET_VALUES_SIZE, &ml_count)) return -1;
+    if ((uint32_t)ml_index >= ml_count) return -1;
+
+    void *ml_buf = NULL;
+    if (!safe_read_ptr((char*)ml_mgr + CNEM_OFFSET_VALUES_BUF, &ml_buf) || !ml_buf) return -1;
+
+    void *ml = NULL;
+    if (!safe_read_ptr((char*)ml_buf + (size_t)ml_index * sizeof(void*), &ml) || !ml) return -1;
+
+    // ModifierList must be a plausible pointer before we call into it.
+    if ((uintptr_t)ml < 0x100000000ULL) return -1;
+
+    uint32_t name_idx = fixed_string_intern(prop, -1);
+    if (name_idx == FS_NULL_INDEX) return -1;
+
+    int handle = g_ModifierGetHandleByName(ml, &name_idx);
+    if (handle < 0) return -1;
+
+    // Bound against the object's IndexedProperties length before it is used as an index.
+    int prop_count = stats_get_property_count(obj);
+    if (prop_count >= 0 && handle >= prop_count) return -1;
+
+    return handle;
+}
+
 // Helper: Resolve property name to index via ModifierList
 // Returns -1 on failure
 static int get_property_index(StatsObjectPtr obj, const char *prop) {
+    // Real game stats: prefer the engine's own name->handle resolution (version-safe).
+    if (!is_shadow_stat(obj)) {
+        int idx = game_resolve_attr_index(obj, prop);
+        if (idx >= 0) return idx;
+    }
+
+    // Shadow stats, or fallback when the accessor is unavailable: manual ML walk.
     void *modifier_list = get_object_modifier_list(obj);
     if (!modifier_list) return -1;
     return find_property_index_by_name(modifier_list, prop);
@@ -1163,6 +1232,25 @@ static int get_property_index(StatsObjectPtr obj, const char *prop) {
 
 const char* stats_get_string(StatsObjectPtr obj, const char *prop) {
     if (!obj || !prop) return NULL;
+
+    // Real game stats: ask the engine directly. GetFixedStringValue resolves
+    // name -> attribute -> FixedStrings pool internally and returns a pointer to a
+    // 4-byte FixedString index (or &FixedString::Empty on miss / non-string prop).
+    if (!is_shadow_stat(obj) && g_GetFixedStringValue) {
+        uint32_t name_idx = fixed_string_intern(prop, -1);
+        if (name_idx != FS_NULL_INDEX) {
+            const uint32_t *fs_ref = g_GetFixedStringValue(obj, &name_idx);
+            if (fs_ref) {
+                uint32_t fs_index = 0;
+                if (safe_read_u32((void*)fs_ref, &fs_index) &&
+                    fs_index != 0 && fs_index != FS_NULL_INDEX) {
+                    const char *s = fixed_string_resolve(fs_index);
+                    if (s && s[0]) return s;
+                }
+            }
+        }
+        // Empty / non-string property: fall through so int/float attempts still run.
+    }
 
     int prop_index = get_property_index(obj, prop);
     if (prop_index < 0) return NULL;

@@ -19,6 +19,7 @@
 #include "imgui_metal_backend.h"
 #include "imgui_input_hooks.h"
 #include "imgui_objects.h"
+#include "imgui_console.h"
 #include "lua_imgui.h"
 #include "imgui.h"
 #include "imgui_impl_metal.h"
@@ -34,6 +35,7 @@ static struct {
     bool visible;
     bool pending_visible;      // Visibility requested before ready
     bool capturing_input;
+    bool console_visible;      // ImGui Lua console window (independent of `visible`)
 
     // Metal state
     id<MTLDevice> device;
@@ -59,6 +61,7 @@ static struct {
     false,                              // visible
     false,                              // pending_visible
     false,                              // capturing_input
+    false,                              // console_visible
     nil,                                // device
     nil,                                // commandQueue
     nil,                                // renderPassDescriptor
@@ -151,7 +154,7 @@ static void remove_layer_hook(void) {
 
 static void hooked_present(id self, SEL _cmd) {
     // Render ImGui BEFORE presenting (so it appears on top of game content)
-    if (s_state.state == IMGUI_METAL_STATE_READY && s_state.visible) {
+    if (s_state.state == IMGUI_METAL_STATE_READY && (s_state.visible || s_state.console_visible)) {
         id<CAMetalDrawable> drawable = (id<CAMetalDrawable>)self;
         imgui_metal_render_frame(drawable);
 
@@ -308,6 +311,12 @@ static void imgui_metal_setup_context(void) {
             s_state.state = IMGUI_METAL_STATE_ERROR;
             return;
         }
+        // Disable the OSX backend's native IME hook. When an InputText is focused
+        // ImGui would call [NSTextInputContext activate], which creates a TUINSWindow
+        // off the main thread (we render from the present hook) and raises an NSException
+        // -> SIGABRT. We feed characters directly via io.AddInputCharacter
+        // (imgui_metal_process_char), so the native IME candidate window isn't needed.
+        ImGui::GetPlatformIO().Platform_SetImeDataFn = nullptr;
     }
 
     // Create render pass descriptor
@@ -1113,38 +1122,15 @@ static void imgui_metal_render_frame(id<CAMetalDrawable> drawable) {
             }
             debug_log_counter++;
 
-            // Also show built-in debug window for testing
-            ImGui::SetNextWindowPos(ImVec2(100, 100), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowSize(ImVec2(400, 300), ImGuiCond_FirstUseEver);
-            ImGui::SetNextWindowBgAlpha(1.0f);  // Fully opaque background
-
-            if (ImGui::Begin("BG3SE Debug", nullptr, ImGuiWindowFlags_NoCollapse)) {
-                ImGui::TextColored(ImVec4(1,1,0,1), "=== IMGUI OVERLAY TEST ===");
-                ImGui::Text("Frame: %llu", s_state.frame_count);
-                ImGui::Separator();
-                ImGui::TextColored(ImVec4(0,1,0,1), "If you can see this, ImGui is working!");
-                ImGui::Text("Device: %s", [[s_state.device name] UTF8String]);
-
-                // Debug: Show mouse position and window bounds
-                ImGuiIO& dbgIo = ImGui::GetIO();
-                ImGui::Text("Mouse: (%.0f, %.0f)", dbgIo.MousePos.x, dbgIo.MousePos.y);
-                ImGui::Text("WantCapture: %d  MouseDown: %d", dbgIo.WantCaptureMouse, dbgIo.MouseDown[0]);
-                ImGui::Text("DisplaySize: %.0fx%.0f", dbgIo.DisplaySize.x, dbgIo.DisplaySize.y);
-
-                // Show Lua window count
-                ImGui::Separator();
-                ImGui::Text("Lua Windows: %d", window_count);
-
-                // Test button
-                ImGui::Separator();
-                if (ImGui::Button("Test Button")) {
-                    LOG_IMGUI_INFO("Button clicked!");
-                }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::TextColored(ImVec4(0,1,0,1), "HOVERING");
+            // In-game Lua console (output log + input). Independent of the F11
+            // Lua-window overlay above; toggled via Ctrl+` / Ext.IMGUI.ToggleConsole().
+            if (s_state.console_visible) {
+                imgui_console_draw(&s_state.console_visible);
+                if (!s_state.console_visible) {
+                    // User closed it via the window button — drop input capture.
+                    s_state.capturing_input = s_state.visible;
                 }
             }
-            ImGui::End();
 
             // End frame and render
             ImGui::Render();
@@ -1258,7 +1244,37 @@ void imgui_metal_set_input_capture(bool capture) {
 }
 
 bool imgui_metal_is_capturing_input(void) {
-    return s_state.capturing_input && s_state.visible;
+    return s_state.capturing_input && (s_state.visible || s_state.console_visible);
+}
+
+// ----------------------------------------------------------------------------
+// In-game Lua console (separate from the F11 Lua-window overlay)
+// ----------------------------------------------------------------------------
+
+void imgui_metal_show_console(void) {
+    if (s_state.state == IMGUI_METAL_STATE_UNINITIALIZED) {
+        imgui_metal_init();  // lazy-init the Metal backend on first use
+    }
+    s_state.console_visible = true;
+    s_state.capturing_input = true;   // route keyboard to the console input field
+    imgui_console_focus_input();
+}
+
+void imgui_metal_hide_console(void) {
+    s_state.console_visible = false;
+    s_state.capturing_input = s_state.visible;  // keep capture only if overlay still up
+}
+
+void imgui_metal_toggle_console(void) {
+    if (s_state.console_visible) {
+        imgui_metal_hide_console();
+    } else {
+        imgui_metal_show_console();
+    }
+}
+
+bool imgui_metal_is_console_visible(void) {
+    return s_state.console_visible;
 }
 
 void imgui_metal_get_viewport_size(float *width, float *height) {
@@ -1414,8 +1430,9 @@ bool imgui_metal_process_key(uint16_t keycode, bool down, uint32_t modifiers) {
         return true;  // Always consume F11
     }
 
-    // Other keys only processed when visible
-    if (!s_state.visible || s_state.state != IMGUI_METAL_STATE_READY) {
+    // Other keys only processed when the overlay or the console is visible.
+    if ((!s_state.visible && !s_state.console_visible) ||
+        s_state.state != IMGUI_METAL_STATE_READY) {
         return false;
     }
 
@@ -1486,7 +1503,8 @@ static bool convert_screen_to_window(float screenX, float screenY, float *outX, 
 }
 
 bool imgui_metal_process_mouse(float x, float y, int button, bool down) {
-    if (!s_state.visible || s_state.state != IMGUI_METAL_STATE_READY) {
+    if ((!s_state.visible && !s_state.console_visible) ||
+        s_state.state != IMGUI_METAL_STATE_READY) {
         return false;
     }
 
@@ -1536,7 +1554,8 @@ void imgui_metal_process_mouse_move(float x, float y) {
 
 // Direct input functions - coordinates already in ImGui space (from NSView swizzling)
 bool imgui_metal_process_mouse_direct(float x, float y, int button, bool down) {
-    if (!s_state.visible || s_state.state != IMGUI_METAL_STATE_READY) {
+    if ((!s_state.visible && !s_state.console_visible) ||
+        s_state.state != IMGUI_METAL_STATE_READY) {
         return false;
     }
 
@@ -1561,17 +1580,20 @@ void imgui_metal_process_mouse_move_direct(float x, float y) {
     io.AddMousePosEvent(x, y);
 }
 
-void imgui_metal_process_scroll(float dx, float dy) {
-    if (!s_state.visible || s_state.state != IMGUI_METAL_STATE_READY) {
-        return;
+bool imgui_metal_process_scroll(float dx, float dy) {
+    if ((!s_state.visible && !s_state.console_visible) ||
+        s_state.state != IMGUI_METAL_STATE_READY) {
+        return false;
     }
 
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseWheelEvent(dx, dy);
+    return s_state.capturing_input && io.WantCaptureMouse;
 }
 
 void imgui_metal_process_char(unsigned int c) {
-    if (!s_state.visible || s_state.state != IMGUI_METAL_STATE_READY ||
+    if ((!s_state.visible && !s_state.console_visible) ||
+        s_state.state != IMGUI_METAL_STATE_READY ||
         !s_state.capturing_input) {
         return;
     }

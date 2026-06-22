@@ -49,6 +49,16 @@ int component_typeid_discover(void);
 int component_typeid_discover_all_generated(void);
 
 /**
+ * Discover component type indices by symbol, version-independently.
+ * Enumerates every ls::TypeId<COMPONENT, ecs::*ComponentTypeIdContext>::m_TypeIndex
+ * global in the executable (via the symbol resolver + demangler), reads each
+ * index, and registers it under COMPONENT. Works on any unstripped build
+ * regardless of address layout (Steam, GOG, future patches).
+ * @return Number of components registered from symbols (0 if symbols unavailable)
+ */
+int component_typeid_discover_symbols(void);
+
+/**
  * Read a specific TypeId global address.
  * @param ghidraAddr The Ghidra address of the m_TypeIndex global
  * @param outIndex Output: the type index value

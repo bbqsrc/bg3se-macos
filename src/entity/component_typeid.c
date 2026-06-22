@@ -11,6 +11,7 @@
 #include "entity_storage.h"  // For GHIDRA_BASE_ADDRESS
 #include "../core/logging.h"
 #include "../core/safe_memory.h"
+#include "../core/symbol_resolver.h"
 
 #include <string.h>
 
@@ -418,6 +419,50 @@ bool component_typeid_read_pointer(uint64_t ghidraAddr, uint16_t *outIndex) {
 }
 
 // ============================================================================
+// Symbol-based discovery (version-independent)
+// ============================================================================
+
+typedef struct {
+    int count;
+} TypeIdSymbolCtx;
+
+// Callback for symbol_resolver_enumerate_typeids(): read the index out of the
+// resolved global and register it under the demangled component name.
+static void on_typeid_symbol(const char *component, void *addr,
+                             bool is_one_frame, void *user) {
+    TypeIdSymbolCtx *ctx = (TypeIdSymbolCtx *)user;
+
+    // The address is already slid; validate before reading the 4-byte index.
+    mach_vm_address_t a = (mach_vm_address_t)(uintptr_t)addr;
+    SafeMemoryInfo info = safe_memory_check_address(a);
+    if (!info.is_valid || !info.is_readable) return;
+    if (safe_memory_is_gpu_region(a)) return;
+
+    int32_t rawValue = -1;
+    if (!safe_memory_read_i32(a, &rawValue)) return;
+    if (rawValue < 0 || rawValue > 0xFFFF) return;  // uninitialized / garbage
+
+    uint16_t typeIndex = (uint16_t)rawValue;
+    // One-frame components carry the 0x8000 bit in the registry so storage
+    // lookups search the OneFrameComponents pool (mirrors legacy discovery).
+    uint16_t registeredIndex = is_one_frame ? (typeIndex | 0x8000) : typeIndex;
+
+    if (component_registry_register(component, registeredIndex, 0, false)) {
+        // Property layouts are keyed by the raw (non-flagged) type index.
+        component_property_set_type_index(component, typeIndex);
+        ctx->count++;
+    }
+}
+
+int component_typeid_discover_symbols(void) {
+    TypeIdSymbolCtx ctx = { 0 };
+    int reported = symbol_resolver_enumerate_typeids(on_typeid_symbol, &ctx);
+    LOG_ENTITY_DEBUG("Symbol discovery: %d TypeId globals seen, %d registered",
+               reported, ctx.count);
+    return ctx.count;
+}
+
+// ============================================================================
 // Discovery
 // ============================================================================
 
@@ -427,7 +472,17 @@ int component_typeid_discover(void) {
         return 0;
     }
 
-    LOG_ENTITY_DEBUG("Discovering component type indices from TypeId globals...");
+    // Preferred path: resolve component type indices by symbol. This is
+    // version-independent — it works on any unstripped build (Steam, GOG, and
+    // future patches) where the hardcoded Ghidra addresses below would be wrong.
+    int viaSymbols = component_typeid_discover_symbols();
+    if (viaSymbols > 0) {
+        LOG_ENTITY_DEBUG("Discovered %d component type indices via symbols", viaSymbols);
+        return viaSymbols;
+    }
+
+    LOG_ENTITY_DEBUG("Symbol-based discovery unavailable; "
+               "falling back to hardcoded TypeId addresses...");
 
     int discovered = 0;
 

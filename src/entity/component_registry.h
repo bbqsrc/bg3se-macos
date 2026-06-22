@@ -62,9 +62,10 @@ typedef struct {
 // Registry Configuration
 // ============================================================================
 
-// Maximum number of components the registry can track
-// Must be > 1999 (total components in BG3 binary) + headroom for sub-namespaces
-#define COMPONENT_REGISTRY_MAX_COMPONENTS 2500
+// Maximum number of components the registry can track.
+// Symbol-based discovery enumerates ~2635 distinct component TypeId globals
+// (2101 regular + 534 one-frame); keep headroom above that.
+#define COMPONENT_REGISTRY_MAX_COMPONENTS 3072
 
 // Maximum component name length
 #define COMPONENT_MAX_NAME_LEN 128

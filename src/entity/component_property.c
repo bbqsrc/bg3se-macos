@@ -27,6 +27,21 @@
 #define COMPONENT_PROXY_METATABLE "bg3se.ComponentProxy"
 #define ARRAY_PROXY_METATABLE "bg3se.ArrayProxy"
 
+// Format a 16-byte ls::Guid (component storage order) as a canonical UUID
+// string matching Osi / Windows BG3SE. The struct stores the GUID such that the
+// canonical bytes are: group1 = bytes[3..0], group2 = [5,4], group3 = [7,6],
+// group4 = [9,8], group5 = [11,10,13,12,15,14] (adjacent-pair swap).
+// Output buffer must hold at least 37 bytes.
+void component_property_format_guid(const uint8_t g[16], char *out) {
+    snprintf(out, 37,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             g[3], g[2], g[1], g[0],
+             g[5], g[4],
+             g[7], g[6],
+             g[9], g[8],
+             g[11], g[10], g[13], g[12], g[15], g[14]);
+}
+
 // Array<T> memory layout on ARM64
 #define ARRAY_BUF_OFFSET    0x00   // T* buf_
 #define ARRAY_CAP_OFFSET    0x08   // uint32_t capacity_
@@ -353,12 +368,7 @@ int component_property_read_def(lua_State *L, void *componentPtr,
             uint8_t guid[16] = {0};
             if (safe_memory_read((mach_vm_address_t)addr, guid, 16)) {
                 char buf[64];
-                snprintf(buf, sizeof(buf),
-                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                        guid[0], guid[1], guid[2], guid[3],
-                        guid[4], guid[5], guid[6], guid[7],
-                        guid[8], guid[9], guid[10], guid[11],
-                        guid[12], guid[13], guid[14], guid[15]);
+                component_property_format_guid(guid, buf);
                 lua_pushstring(L, buf);
             } else {
                 lua_pushnil(L);
@@ -619,12 +629,7 @@ static int array_proxy_push_element(lua_State *L, ArrayProxy *proxy, void *buf, 
             uint8_t guid[16] = {0};
             if (safe_memory_read((mach_vm_address_t)elemAddr, guid, 16)) {
                 char buf[64];
-                snprintf(buf, sizeof(buf),
-                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-                        guid[0], guid[1], guid[2], guid[3],
-                        guid[4], guid[5], guid[6], guid[7],
-                        guid[8], guid[9], guid[10], guid[11],
-                        guid[12], guid[13], guid[14], guid[15]);
+                component_property_format_guid(guid, buf);
                 lua_pushstring(L, buf);
             } else {
                 lua_pushnil(L);

@@ -99,6 +99,16 @@ void imgui_metal_set_input_capture(bool capture);
 bool imgui_metal_is_capturing_input(void);
 
 /**
+ * In-game Lua console (output log + input field). Independent of the F11
+ * Lua-window overlay. show/toggle lazy-initialize the Metal backend, make the
+ * console window visible, capture keyboard, and focus the input field.
+ */
+void imgui_metal_show_console(void);
+void imgui_metal_hide_console(void);
+void imgui_metal_toggle_console(void);
+bool imgui_metal_is_console_visible(void);
+
+/**
  * Process a keyboard event for ImGui.
  * Called from input_hooks.m when a key event occurs.
  *
@@ -164,7 +174,7 @@ void imgui_metal_get_viewport_size(float *width, float *height);
  * @param dx Horizontal scroll delta
  * @param dy Vertical scroll delta
  */
-void imgui_metal_process_scroll(float dx, float dy);
+bool imgui_metal_process_scroll(float dx, float dy);
 
 /**
  * Process character input for text fields.

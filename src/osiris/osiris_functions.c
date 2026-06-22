@@ -499,15 +499,17 @@ void osi_func_enumerate(void) {
     // 1. Regular functions: 0 to ~64K (low IDs)
     // 2. Registered functions: 0x80000000 + offset (high bit set)
 
-    // Probe low range (regular functions) - usually 0-10000
-    for (uint32_t id = 1; id < 10000 && found_count < 1000; id++) {
+    // Probe low range (regular functions incl. databases like DB_Players).
+    // No found_count cap — sweep the whole range so databases past the first ~1000
+    // functions are discovered. osi_func_cache() self-limits at MAX_CACHED_FUNCTIONS.
+    for (uint32_t id = 1; id < 20000 && g_funcCacheCount < MAX_CACHED_FUNCTIONS; id++) {
         if (osi_func_cache_by_id(id)) {
             found_count++;
         }
     }
 
-    // Probe high range (registered functions) - 0x80000000 + 0 to ~30000
-    for (uint32_t offset = 0; offset < 30000 && found_count < 2000; offset++) {
+    // Probe high range (registered functions) - 0x80000000 + offset.
+    for (uint32_t offset = 0; offset < 30000 && g_funcCacheCount < MAX_CACHED_FUNCTIONS; offset++) {
         uint32_t id = 0x80000000 | offset;
         if (osi_func_cache_by_id(id)) {
             found_count++;

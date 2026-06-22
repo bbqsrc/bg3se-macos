@@ -48,6 +48,7 @@ typedef enum {
 
 static bool g_metal_visible = true;
 static bool g_metal_capturing = false;
+static bool g_metal_console_visible = false;
 
 bool imgui_metal_init(void) { return true; }
 void imgui_metal_shutdown(void) {}
@@ -57,6 +58,10 @@ void imgui_metal_set_visible(bool visible) { g_metal_visible = visible; }
 bool imgui_metal_is_visible(void) { return g_metal_visible; }
 void imgui_metal_set_input_capture(bool capture) { g_metal_capturing = capture; }
 bool imgui_metal_is_capturing_input(void) { return g_metal_capturing; }
+void imgui_metal_show_console(void) { g_metal_console_visible = true; }
+void imgui_metal_hide_console(void) { g_metal_console_visible = false; }
+void imgui_metal_toggle_console(void) { g_metal_console_visible = !g_metal_console_visible; }
+bool imgui_metal_is_console_visible(void) { return g_metal_console_visible; }
 }
 
 // Forward declarations

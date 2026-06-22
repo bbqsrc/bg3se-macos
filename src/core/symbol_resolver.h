@@ -56,6 +56,28 @@ int symbol_resolve_batch(const char *const *names, void **out, int count);
  */
 void *resolve_addr(const char *mangled_name, uint64_t ghidra_fallback);
 
+/**
+ * Callback for symbol_resolver_enumerate_typeids().
+ * @param component   Demangled component name (e.g. "eoc::party::MemberComponent").
+ *                    Valid only for the duration of the call.
+ * @param addr        Slid runtime address of the TypeId<...>::m_TypeIndex global.
+ * @param is_one_frame True if this is a OneFrameComponentTypeIdContext TypeId.
+ * @param user        Opaque user pointer passed through.
+ */
+typedef void (*TypeIdSymbolCb)(const char *component, void *addr,
+                               bool is_one_frame, void *user);
+
+/**
+ * Enumerate every component TypeId global in the main executable:
+ *   ls::TypeId<COMPONENT, ecs::ComponentTypeIdContext>::m_TypeIndex
+ *   ls::TypeId<COMPONENT, ecs::OneFrameComponentTypeIdContext>::m_TypeIndex
+ * in a SINGLE symbol-table pass, demangling each via __cxa_demangle to recover
+ * COMPONENT. This makes component type-index discovery version-independent
+ * (addresses shift across builds; mangled names do not).
+ * @return number of TypeId globals reported via the callback.
+ */
+int symbol_resolver_enumerate_typeids(TypeIdSymbolCb cb, void *user);
+
 #ifdef __cplusplus
 }
 #endif

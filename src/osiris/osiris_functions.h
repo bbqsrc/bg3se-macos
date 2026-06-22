@@ -19,9 +19,9 @@ extern "C" {
 // Configuration
 // ============================================================================
 
-#define MAX_CACHED_FUNCTIONS 4096
-#define FUNC_HASH_SIZE 8192
-#define FUNC_NAME_HASH_SIZE 8192
+#define MAX_CACHED_FUNCTIONS 8192
+#define FUNC_HASH_SIZE 16384
+#define FUNC_NAME_HASH_SIZE 16384
 #define MAX_SEEN_FUNC_IDS 256
 
 // ============================================================================

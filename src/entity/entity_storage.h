@@ -25,8 +25,12 @@ extern "C" {
 // ASLR base for Ghidra addresses
 #define GHIDRA_BASE_ADDRESS             0x100000000ULL
 
-// EntityStorageContainer::TryGet function address (Ghidra)
+// ecs::EntityStorageContainer::TryGet(ls::ID<ecs::EntityHandleTraits>) -> EntityStorageData*
+// Resolved by symbol (version-independent); the Steam Ghidra address is a
+// version-gated fallback. Non-const overload (returns a mutable storage ptr).
 #define ADDR_STORAGE_CONTAINER_TRYGET   0x10636b27cULL
+#define SYM_STORAGE_CONTAINER_TRYGET \
+    "__ZN3ecs22EntityStorageContainer6TryGetEN2ls2IDINS_18EntityHandleTraitsEEE"
 
 // EntityWorld offsets
 #define ENTITYWORLD_STORAGE_OFFSET      0x2d0   // EntityStorageContainer*

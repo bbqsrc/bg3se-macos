@@ -12,7 +12,7 @@
 #include "../core/logging.h"
 #include "../lua/lua_events.h"
 #include "../lua/lua_context.h"
-#include "../overlay/overlay.h"
+#include "../imgui/imgui_console.h"
 #include "../lifetime/lifetime.h"
 #include "../entity/component_typeid.h"
 #include "../osiris/osiris_functions.h"
@@ -309,8 +309,8 @@ void console_send_output(const char *message, bool is_error) {
         }
     }
 
-    // Also forward to overlay console (without ANSI codes)
-    overlay_append_output(message);
+    // Also forward to the in-game ImGui console (without ANSI codes)
+    imgui_console_add_log(message, is_error);
 }
 
 void console_printf(const char *format, ...) {
@@ -485,6 +485,56 @@ static int dispatch_console_command(lua_State *L, const char *line, int client_s
 // Line Processing
 // ============================================================================
 
+// Execute a Lua chunk like a REPL: try it as an expression first (so a bare
+// expression such as `Osi.GetHostCharacter()` prints its result), otherwise run
+// it as a statement. Any return values are printed via console_send_output, so
+// they appear in the in-game console and on connected sockets.
+static void console_eval_and_print(lua_State *L, const char *code) {
+    int base = lua_gettop(L);
+
+    // First try "return <code>" so expressions yield a value to print.
+    int loaded;
+    size_t n = strlen(code);
+    char *expr = (char *)malloc(n + 8);
+    if (expr) {
+        memcpy(expr, "return ", 7);
+        memcpy(expr + 7, code, n + 1);
+        loaded = luaL_loadstring(L, expr);
+        free(expr);
+        if (loaded != LUA_OK) {
+            lua_pop(L, 1);                      // discard the expression compile error
+            loaded = luaL_loadstring(L, code);  // fall back to a statement
+        }
+    } else {
+        loaded = luaL_loadstring(L, code);
+    }
+
+    if (loaded != LUA_OK) {
+        const char *err = lua_tostring(L, -1);
+        console_error("Error: %s", err ? err : "(unknown)");
+        LOG_CONSOLE_ERROR("Error: %s", err ? err : "(unknown)");
+        lua_pop(L, 1);
+        return;
+    }
+
+    if (lua_pcall(L, 0, LUA_MULTRET, 0) != LUA_OK) {
+        const char *err = lua_tostring(L, -1);
+        console_error("Error: %s", err ? err : "(unknown)");
+        LOG_CONSOLE_ERROR("Error: %s", err ? err : "(unknown)");
+        lua_pop(L, 1);
+        return;
+    }
+
+    // Print each return value (luaL_tolstring honors __tostring).
+    int top = lua_gettop(L);
+    for (int i = base + 1; i <= top; i++) {
+        const char *s = luaL_tolstring(L, i, NULL);  // pushes the string
+        console_send_output(s ? s : "nil", false);
+        lua_pop(L, 1);                               // pop the pushed string
+    }
+    lua_settop(L, base);                             // drop the results
+}
+
 static void process_line(lua_State *L, char *line, int client_slot) {
     trim_trailing_newline(line);
     size_t len = strlen(line);
@@ -534,15 +584,7 @@ static void process_line(lua_State *L, char *line, int client_slot) {
         LuaContext saved_ctx = lua_context_get();
         lua_context_set(LUA_CONTEXT_SERVER);
 
-        int result = luaL_dostring(L, s_multiline_buffer);
-        if (result != LUA_OK) {
-            const char *err = lua_tostring(L, -1);
-            if (client_slot >= 0) {
-                console_error("Error: %s", err ? err : "(unknown)");
-            }
-            LOG_CONSOLE_ERROR("Error: %s", err ? err : "(unknown)");
-            lua_pop(L, 1);
-        }
+        console_eval_and_print(L, s_multiline_buffer);
 
         lua_context_set(saved_ctx);
 
@@ -597,15 +639,7 @@ static void process_line(lua_State *L, char *line, int client_slot) {
     LuaContext saved_ctx = lua_context_get();
     lua_context_set(LUA_CONTEXT_SERVER);
 
-    int result = luaL_dostring(L, line);
-    if (result != LUA_OK) {
-        const char *err = lua_tostring(L, -1);
-        if (client_slot >= 0) {
-            console_error("Error: %s", err ? err : "(unknown)");
-        }
-        LOG_CONSOLE_ERROR("Error: %s", err ? err : "(unknown)");
-        lua_pop(L, 1);
-    }
+    console_eval_and_print(L, line);
 
     lua_context_set(saved_ctx);
 

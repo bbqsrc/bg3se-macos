@@ -198,7 +198,6 @@ add_library(bg3se SHARED
     src/input/lua_input.c
     src/math/math_ext.c
     src/math/lua_math.c
-    src/overlay/overlay.m
     src/vars/user_variables.c
     src/lifetime/lifetime.c
     src/localization/localization.c
@@ -238,6 +237,7 @@ add_library(bg3se SHARED
     src/imgui/imgui_metal_backend.mm
     src/imgui/imgui_input_hooks.mm
     src/imgui/imgui_objects.c
+    src/imgui/imgui_console.cpp
 )
 
 target_compile_options(bg3se PRIVATE

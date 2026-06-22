@@ -190,3 +190,69 @@ void *resolve_addr(const char *mangled_name, uint64_t ghidra_fallback) {
     }
     return NULL;
 }
+
+// ============================================================================
+// Component TypeId enumeration (demangle pass)
+// ============================================================================
+
+// Itanium ABI demangler (libc++abi). Declared here to keep this a C TU.
+extern char *__cxa_demangle(const char *mangled, char *buf, size_t *n, int *status);
+
+// Constant mangled suffixes that uniquely identify the two component TypeId
+// global flavours. The COMPONENT template arg varies (and may use substitution
+// compression, e.g. NS_4uuid9Component for ls::uuid::Component), but these
+// suffixes are invariant, so they make a precise, mangling-agnostic prefilter.
+#define MANGLED_REG_SUFFIX "N3ecs22ComponentTypeIdContextEE11m_TypeIndexE"
+#define MANGLED_OF_SUFFIX  "N3ecs30OneFrameComponentTypeIdContextEE11m_TypeIndexE"
+
+// Demangled wrappers around the COMPONENT name.
+static const char DM_PREFIX[]     = "ls::TypeId<";
+static const char DM_REG_SUFFIX[] = ", ecs::ComponentTypeIdContext>::m_TypeIndex";
+static const char DM_OF_SUFFIX[]  = ", ecs::OneFrameComponentTypeIdContext>::m_TypeIndex";
+
+int symbol_resolver_enumerate_typeids(TypeIdSymbolCb cb, void *user) {
+    if (!g_inited || !cb) return 0;
+
+    // Reused across demangle calls; __cxa_demangle realloc's as needed.
+    char *dmbuf = NULL;
+    size_t dmlen = 0;
+    int reported = 0;
+
+    for (uint32_t i = 0; i < g_nsyms; i++) {
+        const struct nlist_64 *s = &g_symtab[i];
+        if (s->n_value == 0) continue;
+        uint32_t strx = s->n_un.n_strx;
+        if (strx == 0 || strx >= g_strsize) continue;
+        const char *sym = g_strtab + strx;
+
+        // Cheap prefilter: must be an ls::TypeId<...> with a component context.
+        if (!strstr(sym, "6TypeIdI")) continue;
+        bool one_frame;
+        if (strstr(sym, MANGLED_REG_SUFFIX)) {
+            one_frame = false;
+        } else if (strstr(sym, MANGLED_OF_SUFFIX)) {
+            one_frame = true;
+        } else {
+            continue;
+        }
+
+        int status = -1;
+        char *dm = __cxa_demangle(sym, dmbuf, &dmlen, &status);
+        if (!dm || status != 0) continue;
+        dmbuf = dm;  // keep the (possibly grown) buffer for reuse
+
+        // dm = "ls::TypeId<COMPONENT, ecs::...Context>::m_TypeIndex"
+        if (strncmp(dm, DM_PREFIX, sizeof(DM_PREFIX) - 1) != 0) continue;
+        char *comp = dm + (sizeof(DM_PREFIX) - 1);
+        char *suffix = strstr(comp, one_frame ? DM_OF_SUFFIX : DM_REG_SUFFIX);
+        if (!suffix) continue;
+        *suffix = '\0';  // terminate COMPONENT in place (buffer is reused next iter)
+
+        void *addr = (void *)(uintptr_t)(s->n_value + (uint64_t)g_slide);
+        cb(comp, addr, one_frame, user);
+        reported++;
+    }
+
+    free(dmbuf);
+    return reported;
+}

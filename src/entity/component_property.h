@@ -136,6 +136,12 @@ const ComponentLayoutDef *component_property_get_layout_by_index(uint16_t typeIn
  */
 void component_property_set_type_index(const char *componentName, uint16_t typeIndex);
 
+/**
+ * Format a 16-byte ls::Guid (component storage order) as a canonical UUID
+ * string matching Osi / Windows BG3SE. Output buffer must hold >= 37 bytes.
+ */
+void component_property_format_guid(const uint8_t guid[16], char *out);
+
 // ============================================================================
 // Property Reading
 // ============================================================================

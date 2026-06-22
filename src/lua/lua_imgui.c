@@ -314,6 +314,28 @@ static int lua_imgui_is_visible(lua_State *L) {
 }
 
 /**
+ * Ext.IMGUI.ShowConsole() / HideConsole() / ToggleConsole()
+ * Control the in-game Lua console (output log + input field).
+ */
+static int lua_imgui_show_console(lua_State *L) {
+    imgui_metal_show_console();
+    lua_pushboolean(L, true);
+    return 1;
+}
+
+static int lua_imgui_hide_console(lua_State *L) {
+    (void)L;
+    imgui_metal_hide_console();
+    return 0;
+}
+
+static int lua_imgui_toggle_console(lua_State *L) {
+    imgui_metal_toggle_console();
+    lua_pushboolean(L, imgui_metal_is_console_visible());
+    return 1;
+}
+
+/**
  * Ext.IMGUI.IsReady() -> boolean
  * Check if ImGui backend is initialized and ready.
  */
@@ -1942,6 +1964,9 @@ static const luaL_Reg imgui_functions[] = {
     {"Hide", lua_imgui_hide},
     {"Toggle", lua_imgui_toggle},
     {"IsVisible", lua_imgui_is_visible},
+    {"ShowConsole", lua_imgui_show_console},
+    {"HideConsole", lua_imgui_hide_console},
+    {"ToggleConsole", lua_imgui_toggle_console},
     {"IsReady", lua_imgui_is_ready},
     {"GetState", lua_imgui_get_state},
     {"SetInputCapture", lua_imgui_set_input_capture},

@@ -112,8 +112,14 @@ static int g_TypeIdRetryCount = 0;
 #define OFFSET_LEGACY_GET_COMBAT_FROM_GUID 0x101250074
 
 // ecs::legacy::Helper::TryGetSingleton<ls::uuid::ToHandleMappingComponent>(EntityWorld&)
-// This function returns the singleton containing GUID->EntityHandle mappings
+// This function returns the singleton containing GUID->EntityHandle mappings.
+// Resolved by symbol (version-independent); the Steam Ghidra address is a
+// version-gated fallback. The instantiation is the const query-spec overload
+// (read-only lookup); the Steam offset lives in the same code region as this
+// symbol's GOG address, confirming it is the const variant.
 #define OFFSET_TRY_GET_UUID_MAPPING_SINGLETON 0x1010dc924
+#define SYM_TRY_GET_UUID_MAPPING_SINGLETON \
+    "__ZN3ecs6legacy6Helper15TryGetSingletonINS_5query5alive4SpecIN2ls8TypeListIJKNS6_4uuid24ToHandleMappingComponentEEEENS7_IJEEESC_SC_SC_SC_NS_22QueryTypePersistentTagENS_17QueryTypeAliveTagEEEEENS6_6ResultINS_8_private16EntityViewFinderIJNSH_15QueryViewFinderIT_E4typeEEE4typeENS6_5ErrorEJEEERNS_11EntityWorldE"
 
 // ecs::EntityWorld::GetComponent<T> template instances
 // These are direct function addresses from Ghidra analysis
@@ -1011,8 +1017,14 @@ int entity_system_init(void *main_binary_base) {
     LOG_ENTITY_DEBUG("EntityWorld must be set manually via Ext.Entity.SetWorldPtr() or discovered via Osiris hooks");
 
     // Set up function pointers for component accessors and singleton getters
-    // These don't need hooks - we just need to know where to call
-    g_TryGetUuidMappingSingleton = (TryGetSingletonFn)(OFFSET_TRY_GET_UUID_MAPPING_SINGLETON - ghidra_base + actual_base);
+    // These don't need hooks - we just need to know where to call.
+    // Resolve by symbol first (works on any unstripped build); the hardcoded
+    // Steam address is only used as a version-gated fallback. On GOG the Steam
+    // address points at the wrong function and would crash Ext.Entity.Get.
+    g_TryGetUuidMappingSingleton = (TryGetSingletonFn)resolve_addr(
+        SYM_TRY_GET_UUID_MAPPING_SINGLETON, OFFSET_TRY_GET_UUID_MAPPING_SINGLETON);
+    LOG_ENTITY_DEBUG("TryGetUuidMappingSingleton resolved to %p",
+               (void *)g_TryGetUuidMappingSingleton);
 
     // ls:: components - all DISABLED until addresses are verified via Ghidra
     // When offset is 0, pointer stays NULL (safe)

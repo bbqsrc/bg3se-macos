@@ -7,7 +7,9 @@
 
 #include "component_lookup.h"
 #include "arm64_call.h"
+#include "entity_storage.h"
 #include "../core/logging.h"
+#include "../core/symbol_resolver.h"
 
 #include <string.h>
 
@@ -41,9 +43,11 @@ bool component_lookup_init(void *entityWorld, void *binaryBase) {
         return false;
     }
 
-    // Calculate runtime address of TryGet function
-    uintptr_t runtime_addr = ADDR_STORAGE_CONTAINER_TRYGET - GHIDRA_BASE_ADDRESS + (uintptr_t)binaryBase;
-    g_TryGetFnAddr = (void *)runtime_addr;
+    // Resolve TryGet by symbol (version-independent); the hardcoded Steam
+    // address is only a version-gated fallback. On GOG the Steam address points
+    // at the wrong function and crashes when invoked for a component lookup.
+    g_TryGetFnAddr = resolve_addr(SYM_STORAGE_CONTAINER_TRYGET,
+                                  ADDR_STORAGE_CONTAINER_TRYGET);
 
     LOG_ENTITY_DEBUG("Initialized:");
     LOG_ENTITY_DEBUG("  EntityWorld: %p", g_EntityWorld);

@@ -45,6 +45,10 @@ extern "C" {
 // Entity Component System
 #include "entity_system.h"
 #include "entity_events.h"
+#include "component_registry.h"
+#include "component_lookup.h"
+#include "component_property.h"
+#include "safe_memory.h"
 
 // Core modules
 #include "version.h"
@@ -111,8 +115,8 @@ extern "C" {
 // Math library
 #include "math_ext.h"
 
-// Overlay console
-#include "overlay.h"
+// In-game ImGui Lua console
+#include "imgui_console.h"
 
 // ImGui Metal backend
 #include "imgui_metal_backend.h"
@@ -1222,6 +1226,89 @@ static int lua_entity_get_discovered_players(lua_State *L) {
     return 1;
 }
 
+// Resolve a party-member entity handle to its canonical UUID string.
+// Reads ls::uuid::Component (EntityUuid @ +0) and formats it Osi-compatibly.
+static bool party_handle_to_uuid(uint64_t handle, char *out37) {
+    const ComponentInfo *uuidInfo = component_registry_lookup("ls::uuid::Component");
+    if (!uuidInfo || uuidInfo->index == COMPONENT_INDEX_UNDEFINED) return false;
+    void *comp = component_lookup_by_index(handle, uuidInfo->index, 16, false);
+    if (!comp) return false;
+    uint8_t guid[16];
+    if (!safe_memory_read((mach_vm_address_t)(uintptr_t)comp, guid, 16)) return false;
+    component_property_format_guid(guid, out37);
+    return true;
+}
+
+// Append canonical UUIDs of all entities with `componentName` to the Lua array
+// at the top of the stack. If `playersOnly`, skip entities whose UUID isn't a
+// known player (filters camp NPCs like Withers out of camp::PresenceComponent).
+// `seen`/`seenCount` deduplicate across calls; `*outCount` is the running index.
+static void party_append_component_uuids(lua_State *L, const char *componentName,
+                                         bool playersOnly,
+                                         char seen[][40], int *seenCount,
+                                         int *outCount) {
+    const ComponentInfo *info = component_registry_lookup(componentName);
+    if (!info || info->index == COMPONENT_INDEX_UNDEFINED) return;
+
+    static uint64_t handles[512];
+    int n = component_lookup_get_all_with_component(info->index, handles, 512);
+    for (int i = 0; i < n; i++) {
+        char uuid[40];
+        if (!party_handle_to_uuid(handles[i], uuid)) continue;
+
+        if (playersOnly) {
+            bool isPlayer = false;
+            for (int j = 0; j < g_knownPlayerCount; j++) {
+                if (strcmp(g_knownPlayerGuids[j], uuid) == 0) { isPlayer = true; break; }
+            }
+            if (!isPlayer) continue;
+        }
+
+        bool dup = false;
+        for (int j = 0; j < *seenCount; j++) {
+            if (strcmp(seen[j], uuid) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        if (*seenCount < 64) {
+            strncpy(seen[*seenCount], uuid, 39);
+            seen[*seenCount][39] = '\0';
+            (*seenCount)++;
+        }
+        lua_pushstring(L, uuid);
+        lua_rawseti(L, -2, ++(*outCount));
+    }
+}
+
+/**
+ * Ext.Entity.GetPartyMembers([includeCamp]) -> { uuid1, uuid2, ... }
+ * Active party (eoc::party::MemberComponent) as canonical UUIDs. When
+ * includeCamp is true, also appends recruited companions at camp
+ * (eoc::camp::PresenceComponent, filtered to known players).
+ */
+static int lua_entity_get_party_members(lua_State *L) {
+    bool includeCamp = lua_toboolean(L, 1);
+
+    lua_newtable(L);
+    if (!component_lookup_ready()) {
+        return 1;  // empty until EntityWorld is captured
+    }
+
+    char seen[64][40];
+    int seenCount = 0, outCount = 0;
+
+    party_append_component_uuids(L, "eoc::party::MemberComponent", false,
+                                 seen, &seenCount, &outCount);
+    if (includeCamp) {
+        party_append_component_uuids(L, "eoc::camp::PresenceComponent", true,
+                                     seen, &seenCount, &outCount);
+    }
+
+    LOG_ENTITY_DEBUG("GetPartyMembers(includeCamp=%d) returning %d members",
+               includeCamp, outCount);
+    return 1;
+}
+
 // ============================================================================
 // Generic Osi.DB_<name> Accessor
 // ============================================================================
@@ -2044,22 +2131,11 @@ static void load_mod_scripts(lua_State *L) {
 // ============================================================================
 
 /**
- * Callback when user submits a command in the overlay console
- */
-static void overlay_command_handler(const char *command) {
-    if (!command) return;
-
-    // IMPORTANT: Don't execute Lua from AppKit callback context.
-    // Queue the command and execute on the Lua-owning tick thread.
-    console_queue_lua_command(command);
-}
-
-/**
- * Hotkey callback to toggle overlay visibility
+ * Hotkey callback (Ctrl+`) to toggle the in-game ImGui Lua console.
  */
 static void overlay_toggle_hotkey(void *userData) {
     (void)userData;
-    overlay_toggle();
+    imgui_metal_toggle_console();
 }
 
 /**
@@ -2144,12 +2220,11 @@ static void init_lua(void) {
         // Set Lua state for input event dispatch
         input_set_lua_state(L);
 
-        // Initialize overlay console with Tanit symbol
-        overlay_init();
-        overlay_set_command_callback(overlay_command_handler);
+        // Route in-game console submissions to the Lua tick thread (thread-safe).
+        imgui_console_set_submit_callback(console_queue_lua_command);
         console_set_lua_state(L);
 
-        // Register Ctrl+` hotkey to toggle overlay console
+        // Register Ctrl+` hotkey to toggle the in-game ImGui Lua console.
         // macOS keyCode 50 = backtick/grave accent key
         input_register_hotkey(50, INPUT_MOD_CTRL, overlay_toggle_hotkey, NULL, "ToggleConsole");
         LOG_CONSOLE_DEBUG("Registered Ctrl+` hotkey for console toggle");
@@ -2187,6 +2262,8 @@ static void init_lua(void) {
         if (lua_istable(L, -1)) {
             lua_pushcfunction(L, lua_entity_get_discovered_players);
             lua_setfield(L, -2, "GetDiscoveredPlayers");
+            lua_pushcfunction(L, lua_entity_get_party_members);
+            lua_setfield(L, -2, "GetPartyMembers");
         }
         lua_pop(L, 1);  // pop Entity
     }

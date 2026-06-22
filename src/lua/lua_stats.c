@@ -186,10 +186,22 @@ static int lua_stats_object_index(lua_State *L) {
         return 1;
     }
 
-    // Try to get as a stat property
+    // Try to get as a stat property: string, then integer, then float.
     const char *str_val = stats_get_string(ud->obj, key);
     if (str_val) {
         lua_pushstring(L, str_val);
+        return 1;
+    }
+
+    int64_t int_val;
+    if (stats_get_int(ud->obj, key, &int_val)) {
+        lua_pushinteger(L, int_val);
+        return 1;
+    }
+
+    float float_val;
+    if (stats_get_float(ud->obj, key, &float_val)) {
+        lua_pushnumber(L, float_val);
         return 1;
     }
 
