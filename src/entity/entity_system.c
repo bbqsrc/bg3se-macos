@@ -789,10 +789,20 @@ EntityHandle entity_get_by_guid(const char *guid_str) {
     // This handles character entity GUIDs that have prefixes
     const char *uuid_str = extract_uuid_from_guid(guid_str);
 
-    // Check cache first (use original guid_str for exact match)
+    // Check cache first (use original guid_str for exact match). Validate the
+    // cached handle against current storage — after an in-game save-load the
+    // EntityWorld pointer is reused but entities get new handles, so a stale
+    // cached handle would resolve to a despawned entity (component reads return
+    // nil). If TryGet can't find it, evict and fall through to a fresh lookup.
     for (int i = 0; i < g_GuidCacheCount; i++) {
         if (strcmp(g_GuidCache[i].guid, guid_str) == 0) {
-            return g_GuidCache[i].handle;
+            if (!component_lookup_ready() ||
+                component_lookup_get_storage_data(g_GuidCache[i].handle)) {
+                return g_GuidCache[i].handle;  // still valid (or can't validate)
+            }
+            // Stale: remove this entry (swap with last) and re-resolve below.
+            g_GuidCache[i] = g_GuidCache[--g_GuidCacheCount];
+            break;
         }
     }
 

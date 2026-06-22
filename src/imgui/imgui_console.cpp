@@ -47,12 +47,18 @@ imgui_console_submit_fn g_submit = nullptr;
 // Keys off total XP, NOT the applied level, so repeated clicks stack pending
 // level-ups even before they're applied in the character sheet. Per-character
 // (XP is not always shared). Queued via the submit callback (Lua thread).
+//
+// Iterates eoc::party::MemberComponent entities DIRECTLY (handle-based) instead
+// of GetPartyMembers()->Get(uuid): Ext.Entity.Get(uuid) can return a stale
+// handle after an in-game save-load (the guid->handle cache isn't invalidated),
+// which made component reads return nil. The XP grant still uses the UUID
+// (read fresh off the entity) since Osi.AddExplorationExperience takes a GUID.
 const char *kLevelUpLua =
     "local TH={300,900,2700,6500,14000,23000,34000,48000,64000,85000,100000} "
     "local n=0 "
-    "for _,u in ipairs(Ext.Entity.GetPartyMembers()) do "
-    "  local e=Ext.Entity.Get(u); local x=e and e.Experience "
-    "  if x then "
+    "for _,e in ipairs(Ext.Entity.GetAllEntitiesWithComponent('eoc::party::MemberComponent')) do "
+    "  local x=e.Experience; local u=e.Uuid and e.Uuid.EntityUuid "
+    "  if x and u then "
     "    local total=x.TotalExperience or 0; local target "
     "    for _,t in ipairs(TH) do if t>total then target=t break end end "
     "    if target then Osi.AddExplorationExperience(u,target-total); n=n+1 end "
