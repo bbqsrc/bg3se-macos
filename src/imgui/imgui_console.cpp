@@ -41,6 +41,26 @@ bool g_has_pending_paste = false;
 
 imgui_console_submit_fn g_submit = nullptr;
 
+// "Level Up" button: bank one more level per click for each active party
+// member by granting the XP needed to reach the next cumulative-XP threshold
+// ABOVE their current TotalExperience (standard BG3 table, capped at level 12).
+// Keys off total XP, NOT the applied level, so repeated clicks stack pending
+// level-ups even before they're applied in the character sheet. Per-character
+// (XP is not always shared). Queued via the submit callback (Lua thread).
+const char *kLevelUpLua =
+    "local TH={300,900,2700,6500,14000,23000,34000,48000,64000,85000,100000} "
+    "local n=0 "
+    "for _,u in ipairs(Ext.Entity.GetPartyMembers()) do "
+    "  local e=Ext.Entity.Get(u); local x=e and e.Experience "
+    "  if x then "
+    "    local total=x.TotalExperience or 0; local target "
+    "    for _,t in ipairs(TH) do if t>total then target=t break end end "
+    "    if target then Osi.AddExplorationExperience(u,target-total); n=n+1 end "
+    "  end "
+    "end "
+    "_P('Level Up: banked one level for '..n..' party member(s) "
+    "(apply them in each character sheet)') ";
+
 int input_text_callback(ImGuiInputTextCallbackData *data) {
     if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory) {
         const int prev = g_history_pos;
@@ -137,6 +157,10 @@ extern "C" void imgui_console_draw(bool *p_open) {
             g_pending_paste = clip;     // applied next frame (see top of draw)
             g_has_pending_paste = true;
         }
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Level Up")) {
+        if (g_submit) g_submit(kLevelUpLua);
     }
     ImGui::Separator();
 
