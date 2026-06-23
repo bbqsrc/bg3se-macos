@@ -1,0 +1,25 @@
+#!/bin/bash
+# Launch Baldur's Gate 3 with libbg3se.dylib injected via DYLD_INSERT_LIBRARIES.
+# No game-binary modification. Paths resolve at runtime, so a rebuilt dylib
+# (auto-deployed next to the game binary) is always picked up.
+
+BG3_APP="/Applications/Baldur's Gate 3.app"
+DYLIB="$BG3_APP/Contents/MacOS/libbg3se.dylib"
+
+# GOG's executable has a " GOG" suffix; Steam's does not.
+GAME="$BG3_APP/Contents/MacOS/Baldur's Gate 3 GOG"
+[ -x "$GAME" ] || GAME="$BG3_APP/Contents/MacOS/Baldur's Gate 3"
+
+if [ ! -f "$DYLIB" ]; then
+    /usr/bin/osascript -e "display alert \"BG3SE dylib not found\" message \"Expected at: $DYLIB. Build the extender first.\"" >/dev/null 2>&1
+    exit 1
+fi
+
+# Bypass the Larian WebKit launcher so DYLD_INSERT_LIBRARIES reaches the game
+# process (the launcher would otherwise spawn the game without inheriting it).
+defaults write com.larian.bg3 NoLauncher 1 >/dev/null 2>&1
+
+# `arch -e` sets the env var on the (unrestricted) child spawn and keeps the
+# game on arm64. A plain `env DYLD_INSERT_LIBRARIES=... <game>` either gets the
+# var stripped by dyld or falls back to Rosetta/x86_64.
+exec /usr/bin/arch -arm64 -e "DYLD_INSERT_LIBRARIES=$DYLIB" "$GAME" "$@"
