@@ -122,10 +122,15 @@ static int is_valid_name_start(char c) {
 #define FUNCSIG_OUTPARAMLIST_OFFSET  0x18  /* FuncSigOutParamList.Params* (bitmask) */
 #define FUNCSIG_OUTPARAMCOUNT_OFFSET 0x20  /* FuncSigOutParamList.Count (uint32_t) */
 
-/* FunctionParamList field offsets */
+/* FunctionParamList field offsets. The param list is a linked List:
+ *   { void* VMT; Node* Head; Node* Tail; uint32_t Count; }
+ * Count (total in+out params) is at +0x18 — NOT +0x10 (that's Tail, a pointer,
+ * which read as a u32 gave garbage and clamped arity to 0). Verified live:
+ * GetHostCharacter=1, AddExplorationExperience=2, GetGold=2, GetFlag=3, SetFlag=4. */
 #define PARAMLIST_VMT_OFFSET         0x00
-#define PARAMLIST_HEAD_OFFSET        0x08  /* List<FunctionParamDesc>.Head* */
-#define PARAMLIST_SIZE_OFFSET        0x10  /* List<FunctionParamDesc>.Size (uint32_t, total in+out) */
+#define PARAMLIST_HEAD_OFFSET        0x08  /* List node Head* */
+#define PARAMLIST_TAIL_OFFSET        0x10  /* List node Tail* */
+#define PARAMLIST_SIZE_OFFSET        0x18  /* List Count (uint32_t, total in+out params) */
 
 /* Thread-local buffer for extracted function names */
 static __thread char s_extractedName[128];

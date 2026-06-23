@@ -1465,13 +1465,25 @@ static int osi_value_to_lua(lua_State *L, OsiArgumentValue *val) {
             lua_pushnumber(L, val->floatVal);
             return 1;
         case OSI_TYPE_STRING:
-        case OSI_TYPE_GUIDSTRING:
-            if (val->stringVal) {
-                lua_pushstring(L, val->stringVal);
+        case OSI_TYPE_GUIDSTRING: {
+            // An out slot is pre-typed GUIDSTRING before dispatch, but a query
+            // with a non-string out param (e.g. GetFlag's integer result) writes
+            // a non-pointer value here. Never deref a value that isn't a valid
+            // address — guard the read instead of trusting the type.
+            uintptr_t p = (uintptr_t)val->stringVal;
+            if (p == 0) {
+                lua_pushnil(L);
+            } else if (p < 0x100000) {
+                // Too low to be a heap/data pointer — it's an integer the engine
+                // wrote into the string slot (e.g. GetFlag 0/1). Return it as one.
+                lua_pushinteger(L, (lua_Integer)p);
+            } else if (!safe_memory_check_address((mach_vm_address_t)p).is_readable) {
+                lua_pushnil(L);
             } else {
-                lua_pushstring(L, "");
+                lua_pushstring(L, val->stringVal);
             }
             return 1;
+        }
         default:
             LOG_OSIRIS_DEBUG("Unknown type %d", val->typeId);
             lua_pushnil(L);
