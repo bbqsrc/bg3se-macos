@@ -19,7 +19,18 @@ fi
 # process (the launcher would otherwise spawn the game without inheriting it).
 defaults write com.larian.bg3 NoLauncher 1 >/dev/null 2>&1
 
-# `arch -e` sets the env var on the (unrestricted) child spawn and keeps the
-# game on arm64. A plain `env DYLD_INSERT_LIBRARIES=... <game>` either gets the
-# var stripped by dyld or falls back to Rosetta/x86_64.
-exec /usr/bin/arch -arm64 -e "DYLD_INSERT_LIBRARIES=$DYLIB" "$GAME" "$@"
+# Skip intro videos/splash. The dylib's Bink hook is version-gated off on
+# mismatched builds (e.g. GOG), so rely on the game-native settings: the macOS
+# defaults below plus the matching SkipVideo/SkipSplashScreen entries the game
+# persists in graphicSettings.lsx. BG3SE_SKIP_VIDEOS=1 still enables the
+# in-process hook on builds where the version matches.
+defaults write com.larian.bg3 SkipVideo -bool true >/dev/null 2>&1
+defaults write com.larian.bg3 SkipSplashScreen -bool true >/dev/null 2>&1
+
+# `arch -e` sets each var on the (unrestricted) child spawn and keeps the game
+# on arm64. A plain `env DYLD_INSERT_LIBRARIES=... <game>` either gets the var
+# stripped by dyld or falls back to Rosetta/x86_64.
+exec /usr/bin/arch -arm64 \
+    -e "DYLD_INSERT_LIBRARIES=$DYLIB" \
+    -e "BG3SE_SKIP_VIDEOS=1" \
+    "$GAME" "$@"

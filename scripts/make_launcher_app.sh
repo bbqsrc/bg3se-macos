@@ -23,9 +23,19 @@ if [ ! -d "$BG3_APP" ]; then
 fi
 
 rm -rf "$OUT"
-mkdir -p "$OUT/Contents/MacOS"
+mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 cp "$TEMPLATE/Info.plist" "$OUT/Contents/Info.plist"
 cp "$TEMPLATE/launch" "$OUT/Contents/MacOS/launch"
+
+# Reuse BG3's own icon (copied from the install, not committed — it's Larian's
+# art). If it isn't found, drop the icon reference so the bundle still validates.
+ICON_SRC="$BG3_APP/Contents/Resources/BG3Icon.icns"
+if [ -f "$ICON_SRC" ]; then
+    cp "$ICON_SRC" "$OUT/Contents/Resources/BG3Icon.icns"
+else
+    echo "warning: $ICON_SRC not found — launcher will use the default icon" >&2
+    /usr/bin/plutil -remove CFBundleIconFile "$OUT/Contents/Info.plist" >/dev/null 2>&1 || true
+fi
 
 # Point the launcher at this install's game bundle (default is /Applications).
 /usr/bin/sed -i '' "s|^BG3_APP=.*|BG3_APP=\"$BG3_APP\"|" "$OUT/Contents/MacOS/launch"
@@ -34,5 +44,8 @@ chmod +x "$OUT/Contents/MacOS/launch"
 # Ad-hoc sign so the bundle is self-consistent. Locally-created apps are not
 # quarantined, so Gatekeeper does not block them.
 codesign --force --sign - "$OUT" >/dev/null 2>&1 || true
+
+# Nudge Finder/LaunchServices to pick up the icon for an existing bundle path.
+touch "$OUT" 2>/dev/null || true
 
 echo "created: $OUT"
