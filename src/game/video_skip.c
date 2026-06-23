@@ -91,13 +91,12 @@ bool video_skip_init(void *binary_base) {
     }
 
     (void)binary_base;
-    // Only hook on an exact version match: the symbol gives a correct address, but
-    // intercepting Bink during boot has proven destabilising on mismatched builds.
-    // On mismatch the intro simply plays.
-    if (!version_detect_matches()) {
-        LOG_CORE_INFO("[VideoSkip] Version mismatch — skipping LoadVideo hook (intro will play)");
-        return true;
-    }
+    // resolve_addr() returns the LoadVideo symbol address (correct on any
+    // unstripped build, incl. GOG) and only falls back to the hardcoded Ghidra
+    // address on an exact version match. The mangled symbol gives the right
+    // function regardless of version, so we no longer gate the hook on a version
+    // match — on GOG the symbol path drives the skip. If nothing resolves
+    // (stripped binary, unknown version), the intro simply plays.
     void *target = resolve_addr("__ZN3bik11BinkManager9LoadVideoERKN2ls4PathE",
                                 VA_BINK_LOAD_VIDEO);
     if (!target) {
