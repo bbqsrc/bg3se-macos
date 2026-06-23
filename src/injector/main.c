@@ -2273,22 +2273,12 @@ static void init_lua(void) {
     // Must be after entity_register_lua() which creates the Ext.Entity table
     entity_events_register_lua(L);
 
-    // Run a test script (context is NONE at init, before mod loading sets it)
-    const char *test_script =
+    // Print a one-line init banner.
+    const char *init_banner =
         "Ext.Print('BG3SE-macOS Lua runtime initialized!')\n"
-        "Ext.Print('Version: ' .. Ext.GetVersion())\n"
-        "Ext.Print('Context: ' .. Ext.GetContext() .. ' (IsServer=' .. tostring(Ext.IsServer()) .. ', IsClient=' .. tostring(Ext.IsClient()) .. ')')\n"
-        "-- Test JSON parsing\n"
-        "local json = '{\"name\": \"test\", \"value\": 42, \"enabled\": true}'\n"
-        "local parsed = Ext.Json.Parse(json)\n"
-        "if parsed then\n"
-        "  Ext.Print('JSON Parse test: name=' .. tostring(parsed.name) .. ', value=' .. tostring(parsed.value))\n"
-        "end\n"
-        "-- Test _P and _D\n"
-        "_P('Debug print test via _P')\n"
-        "_D({test = 'table', num = 123})\n";
+        "Ext.Print('Version: ' .. Ext.GetVersion())\n";
 
-    if (luaL_dostring(L, test_script) != LUA_OK) {
+    if (luaL_dostring(L, init_banner) != LUA_OK) {
         const char *error = lua_tostring(L, -1);
         LOG_LUA_ERROR(" %s", error);
         lua_pop(L, 1);
