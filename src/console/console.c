@@ -412,6 +412,7 @@ static int dispatch_console_command(lua_State *L, const char *line, int client_s
         console_printf("  !typeids - Show TypeId resolution status");
         console_printf("  !probe_osidef [N] - Dump OsiFunctionDef layout for N functions (default 5)");
         console_printf("  !osi_info <name> - Probe Osiris function cache + pointer chain for <name>");
+        console_printf("  !reenumerate - Re-scan Osiris functions (caches story QRY_/PROC_/DB_ after load)");
         for (int i = 0; i < s_command_count; i++) {
             console_printf("  !%s", s_commands[i].name);
         }
@@ -471,6 +472,20 @@ static int dispatch_console_command(lua_State *L, const char *line, int client_s
         }
         console_printf("Probing OsiFunctionDef layout for %d functions (check log)...", count);
         osi_func_probe_layout(count);
+        return 1;
+    }
+
+    // Built-in !reenumerate command: re-run Osiris function enumeration.
+    // The startup enumeration runs before a save's story compiles (engine
+    // functions only). Re-running after a save is loaded caches the story's
+    // QRY_/PROC_/DB_ functions so Osi.* can call them. Idempotent (dedups).
+    if (strcmp(cmd_name, "reenumerate") == 0) {
+        int before = osi_func_get_cache_count();
+        console_printf("Re-enumerating Osiris functions (was %d cached)...", before);
+        osi_func_enumerate();        // engine DIV functions (id-probe)
+        osi_func_enumerate_hash();   // + ALL story functions (name-hash walk)
+        int after = osi_func_get_cache_count();
+        console_printf("Done: %d -> %d functions cached (+%d).", before, after, after - before);
         return 1;
     }
 

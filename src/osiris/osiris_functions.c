@@ -128,9 +128,17 @@ static int is_valid_name_start(char c) {
  * which read as a u32 gave garbage and clamped arity to 0). Verified live:
  * GetHostCharacter=1, AddExplorationExperience=2, GetGold=2, GetFlag=3, SetFlag=4. */
 #define PARAMLIST_VMT_OFFSET         0x00
-#define PARAMLIST_HEAD_OFFSET        0x08  /* List node Head* */
-#define PARAMLIST_TAIL_OFFSET        0x10  /* List node Tail* */
+#define PARAMLIST_HEAD_OFFSET        0x08  /* List node Head* (= LAST param, declaration order) */
+#define PARAMLIST_TAIL_OFFSET        0x10  /* List node Tail* (= FIRST param, declaration order) */
 #define PARAMLIST_SIZE_OFFSET        0x18  /* List Count (uint32_t, total in+out params) */
+
+/* Param-list node layout (each node is a separate heap alloc), verified live:
+ *   { Node* Prev@0x00; Node* Next@0x08; uint32_t Type@0x10; ... }
+ * The first param (declaration order) is at *(ParamList+0x10); walk forward via
+ * Next@0x08; read the Osiris value type at +0x10. Verified:
+ *   GetGold=[5,1] GetFlag=[16,5,1] SetFlag=[16,5,1,1] AddExplorationExperience=[6,1] */
+#define PARAMNODE_NEXT_OFFSET        0x08  /* Node* Next (toward higher param index) */
+#define PARAMNODE_TYPE_OFFSET        0x10  /* uint32_t Osiris value type (low byte) */
 
 /* Thread-local buffer for extracted function names */
 static __thread char s_extractedName[128];
@@ -349,41 +357,110 @@ void osi_func_cache_set_handle(uint32_t funcId, uint32_t handle) {
     }
 }
 
+void osi_func_cache_set_param_types(uint32_t funcId, const uint8_t *types, uint8_t count) {
+    if (!types || count == 0) return;
+    if (count > MAX_OSI_PARAMS) count = MAX_OSI_PARAMS;
+    for (int i = 0; i < g_funcCacheCount; i++) {
+        if (g_funcCache[i].id == funcId) {
+            memcpy(g_funcCache[i].paramTypes, types, count);
+            return;
+        }
+    }
+}
+
+int osi_func_get_param_types(const char *name, uint8_t *out, int max) {
+    if (!name || !out || max <= 0) return 0;
+
+    int idx = -1;
+    /* Fast path: name hash table */
+    int hash = func_name_hash(name);
+    int16_t h = g_funcNameHashTable[hash];
+    if (h >= 0 && strcmp(g_funcCache[h].name, name) == 0) {
+        idx = h;
+    } else {
+        for (int i = 0; i < g_funcCacheCount; i++) {
+            if (strcmp(g_funcCache[i].name, name) == 0) { idx = i; break; }
+        }
+    }
+    if (idx < 0) return 0;
+
+    int n = g_funcCache[idx].arity;
+    if (n > max) n = max;
+    if (n > MAX_OSI_PARAMS) n = MAX_OSI_PARAMS;
+    memcpy(out, g_funcCache[idx].paramTypes, n);
+    return n;
+}
+
 // Diagnostic counter to limit verbose logging
 static int s_diagLogCount = 0;
 static const int MAX_DIAG_LOGS = 20;
 
-int osi_func_cache_by_id(uint32_t funcId) {
-    /* Need both the function pointer and the manager instance */
-    if (!s_pfn_pFunctionData || !s_ppOsiFunctionMan) {
-        return 0;
+/* funcDef field offsets (authoritative, confirmed via COsiris::GetFunctionMappings
+ * and Norbyte's OsiFunctionDef in GameDefinitions/Osiris.h):
+ *   +0x18 Signature*   (→ +0x08 Name)
+ *   +0x20 Node.Id      (uint32: rete node index; 0 for engine, >0 for story)
+ *   +0x24 FunctionType (uint32: 1=Event 2=Query 3=Call 4=Database 5=Proc ... )
+ *   +0x28 Key[4]       (Key[0]=type, [1]=part2, [2]=funcIndex, [3]=part4)
+ *   +0x38 Handle/OsiFunctionId (uint32: DIV dispatch id; 0 for story functions) */
+#define FUNCDEF_NODEID_OFFSET 0x20
+#define FUNCDEF_TYPE_OFFSET   0x24
+#define FUNCDEF_KEY_OFFSET    0x28
+#define FUNCDEF_HANDLE_OFFSET 0x38
+/* OSI_SYNTHETIC_ID_BASE is defined in osiris_types.h (shared with the dispatcher). */
+
+/* Osiris function name hash (COsiFunctionMan = CSearchIndex<COsiFunctionData*,
+ * COsiString, 1023>). All ~20k functions (engine + story) live here keyed by
+ * "name/arity". Layout confirmed live:
+ *   bucket array @ funcMan+0x10, 1023 buckets of 0x18 bytes each
+ *   bucket = { uint64 size@+0, Node* begin@+8, Node* root@+0x10 }
+ *   tree node = { Node* left@0, Node* right@8, Node* parent@0x10, ...,
+ *                 COsiString key@0x20, COsiFunctionData* value@0x38 } */
+#define FUNCHASH_BUCKETS_OFFSET 0x10
+#define FUNCHASH_BUCKET_STRIDE  0x18
+#define FUNCHASH_BUCKET_ROOT    0x10
+#define FUNCHASH_NUM_BUCKETS    1023
+#define TREENODE_LEFT_OFFSET    0x00
+#define TREENODE_RIGHT_OFFSET   0x08
+#define TREENODE_VALUE_OFFSET   0x38
+
+/* Append a fully-populated cache entry. No dedup — the caller guarantees the
+ * function is not already present (the name-hash walk visits each COsiFunctionData
+ * exactly once, and osi_func_cache_from_event pre-checks). O(1) per call, so
+ * caching all ~20k functions stays linear. Returns the cache index or -1. */
+static int osi_func_cache_append_full(const char *name, uint32_t id, uint8_t arity,
+                                      uint8_t type, uint32_t handle, void *funcDef,
+                                      uint32_t nodeId, const uint8_t *ptypes,
+                                      uint8_t ptypeCount) {
+    if (g_funcCacheCount >= MAX_CACHED_FUNCTIONS) return -1;
+    int idx = g_funcCacheCount;
+    CachedFunction *cf = &g_funcCache[idx];
+    memset(cf, 0, sizeof(*cf));
+    strncpy(cf->name, name, sizeof(cf->name) - 1);
+    cf->id = id;
+    cf->arity = arity;
+    cf->type = type;
+    cf->handle = handle;
+    cf->funcDef = funcDef;
+    cf->nodeId = nodeId;
+    if (ptypes && ptypeCount) {
+        if (ptypeCount > MAX_OSI_PARAMS) ptypeCount = MAX_OSI_PARAMS;
+        memcpy(cf->paramTypes, ptypes, ptypeCount);
     }
+    int idHash = func_id_hash(id);
+    if (g_funcIdHashTable[idHash] < 0) g_funcIdHashTable[idHash] = (int16_t)idx;
+    int nameHash = func_name_hash(cf->name);
+    if (g_funcNameHashTable[nameHash] < 0) g_funcNameHashTable[nameHash] = (int16_t)idx;
+    g_funcCacheCount++;
+    return idx;
+}
 
-    /* Safely read the OsiFunctionMan pointer */
-    void *funcMan = NULL;
-    if (!safe_memory_read_pointer((mach_vm_address_t)s_ppOsiFunctionMan, &funcMan)) {
-        if (s_diagLogCount < MAX_DIAG_LOGS) {
-            LOG_OSIRIS_DEBUG("Failed to read OsiFunctionMan pointer");
-            s_diagLogCount++;
-        }
-        return 0;
-    }
-
-    if (!funcMan) {
-        return 0;
-    }
-
-    /* Call pFunctionData to get function definition */
-    void *funcDef = s_pfn_pFunctionData(funcMan, funcId);
-
-    /* Log first few attempts to see what pFunctionData returns */
-    if (s_diagLogCount < MAX_DIAG_LOGS) {
-        LOG_OSIRIS_DEBUG("Query funcId=0x%08x: funcMan=%p, funcDef=%p", funcId, funcMan, funcDef);
-        s_diagLogCount++;
-    }
-
+/* Extract metadata from a COsiFunctionData* and cache it. Shared by the
+ * id-probe path (osi_func_cache_by_id) and the name-hash walk
+ * (osi_func_enumerate_hash). Engine functions cache under their DIV handle;
+ * story functions (no handle) cache under a synthetic id and keep funcDef +
+ * Node.Id for rete dispatch. hintId is the probed funcId or 0 (hash-walk). */
+static int osi_func_cache_funcdef(void *funcDef, uint32_t hintId) {
     if (funcDef) {
-        /* extract_func_name_from_def now uses safe memory APIs */
         const char *name = extract_func_name_from_def(funcDef);
         if (name && name[0]) {
             /* Read total param count (in+out) via pointer chain:
@@ -391,6 +468,8 @@ int osi_func_cache_by_id(uint32_t funcId) {
              * This gives Params.Size which includes both input AND output params.
              * Windows BG3SE uses this for query dispatch (Function.inl:OsiQuery). */
             uint8_t arity = 0;
+            uint8_t ptypes[MAX_OSI_PARAMS];
+            memset(ptypes, 0, sizeof(ptypes));
             {
                 /* We already know funcDef+0x18 → Signature works (name extraction uses it).
                  * Re-read Signature pointer for the param chain. */
@@ -400,79 +479,147 @@ int osi_func_cache_by_id(uint32_t funcId) {
                     if (safe_memory_read_pointer((mach_vm_address_t)sigPtr + FUNCSIG_PARAMS_OFFSET, &paramListPtr) && paramListPtr) {
                         uint32_t paramSize = 0;
                         if (safe_memory_read_u32((mach_vm_address_t)paramListPtr + PARAMLIST_SIZE_OFFSET, &paramSize)) {
-                            arity = (paramSize <= 20) ? (uint8_t)paramSize : 0;
+                            arity = (paramSize <= MAX_OSI_PARAMS) ? (uint8_t)paramSize : 0;
+                        }
+                        /* Walk the param-list nodes to read per-param Osiris types in
+                         * declaration order: first node = *(ParamList+0x10), walk Next@0x08,
+                         * type byte @ node+0x10. Needed so query out-slots and call inputs
+                         * are typed correctly (e.g. GetFlag's INTEGER out, not GUIDSTRING). */
+                        if (arity > 0) {
+                            void *node = NULL;
+                            if (safe_memory_read_pointer((mach_vm_address_t)paramListPtr + PARAMLIST_TAIL_OFFSET, &node)) {
+                                for (int i = 0; i < arity && node; i++) {
+                                    uint32_t t = 0;
+                                    if (safe_memory_read_u32((mach_vm_address_t)node + PARAMNODE_TYPE_OFFSET, &t)) {
+                                        ptypes[i] = (uint8_t)t;
+                                    }
+                                    void *nxt = NULL;
+                                    if (!safe_memory_read_pointer((mach_vm_address_t)node + PARAMNODE_NEXT_OFFSET, &nxt)) break;
+                                    node = nxt;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            /* Read FunctionType from funcDef + 0x28 (Windows layout: Osiris.h)
-             * Validated by safe_memory_read — same pattern as paramCount above.
+            /* FunctionType at funcDef+0x24 (confirmed via GetFunctionMappings).
              * Fallback: guess from name prefix (QRY_=Query, DB_=Database, etc.) */
             uint32_t rawType = 0;
-            uint8_t type = osi_func_guess_type(name);  // Smart fallback from name prefix
-            if (safe_memory_read_u32((mach_vm_address_t)funcDef + 0x28, &rawType)) {
-                if (rawType == OSI_FUNC_UNKNOWN) {
-                    LOG_OSIRIS_DEBUG("funcId=0x%08x '%s': type=UNKNOWN at +0x28, using guess=%s",
-                                    funcId, name, osi_func_type_str(type));
-                } else if (rawType >= OSI_FUNC_EVENT && rawType <= OSI_FUNC_USERQUERY) {
+            uint8_t type = osi_func_guess_type(name);
+            if (safe_memory_read_u32((mach_vm_address_t)funcDef + FUNCDEF_TYPE_OFFSET, &rawType)) {
+                if (rawType >= OSI_FUNC_EVENT && rawType <= OSI_FUNC_USERQUERY) {
                     type = (uint8_t)rawType;
-                } else {
-                    LOG_OSIRIS_DEBUG("funcId=0x%08x '%s': invalid type %u at +0x28, using guess=%s",
-                                    funcId, name, rawType, osi_func_type_str(type));
                 }
             }
 
-            /* Read Key[4] from funcDef + 0x28 to compute the real handle.
-             * Key[0]=type, Key[1]=Part2, Key[2]=funcIndex, Key[3]=Part4
-             * Handle = OsirisFunctionHandle(Key[0..3]) — typically equals funcId.
-             *
-             * NOTE: Windows layout has Key at +0x28 (after Type at +0x24).
-             * Previously we read from +0x2C which was off by 4. */
-            uint32_t keys[4] = {0};
+            /* Rete node index at funcDef+0x20. 0 = engine (DIV-dispatched),
+             * >0 = story function dispatched through Nodes->Db.Elements[nodeId-1]. */
+            uint32_t nodeId = 0;
+            safe_memory_read_u32((mach_vm_address_t)funcDef + FUNCDEF_NODEID_OFFSET, &nodeId);
+
+            /* DIV dispatch handle: precomputed at funcDef+0x38. Fall back to
+             * encoding Key[0..3] at +0x28, then to the probed hintId. Story
+             * functions have no handle/Key — `handle` stays 0 for them. */
             uint32_t handle = 0;
-            if (safe_memory_read((mach_vm_address_t)funcDef + 0x28,
-                                 keys, sizeof(keys))) {
-                /* Cross-validate: Key[0] should match type from +0x24/+0x28. */
-                if (keys[0] <= OSI_FUNC_USERQUERY) {
+            if (!safe_memory_read_u32((mach_vm_address_t)funcDef + FUNCDEF_HANDLE_OFFSET, &handle) || handle == 0) {
+                uint32_t keys[4] = {0};
+                if (safe_memory_read((mach_vm_address_t)funcDef + FUNCDEF_KEY_OFFSET, keys, sizeof(keys))
+                    && keys[0] >= OSI_FUNC_EVENT && keys[0] <= OSI_FUNC_USERQUERY) {
                     handle = osi_encode_handle(keys[0], keys[1], keys[2], keys[3]);
-                    if (s_diagLogCount < MAX_DIAG_LOGS && keys[0] != type) {
-                        LOG_OSIRIS_WARN("funcId=0x%08x '%s': Key[0]=%u != type=%u "
-                                       "(using Key[0])", funcId, name, keys[0], type);
-                    }
-                } else {
-                    if (s_diagLogCount < MAX_DIAG_LOGS) {
-                        LOG_OSIRIS_WARN("funcId=0x%08x '%s': Key[0]=%u out of range, "
-                                       "using funcId as handle", funcId, name, keys[0]);
-                    }
-                    /* Fallback: funcId IS the handle for Osiris functions */
-                    handle = funcId;
+                } else if (hintId != 0) {
+                    handle = hintId;
                 }
-            } else {
-                /* Fallback: funcId IS the handle (OsirisFunctionHandle(Key[0..3]) == funcId) */
-                handle = funcId;
             }
 
-            /* Log success for first few */
+            /* Cache id: engine functions key on their DIV handle; story functions
+             * (handle==0) get a unique synthetic id so they can be cached and
+             * looked up (dispatch routes them via the rete node, not the handle). */
+            uint32_t cacheId = (handle != 0) ? handle
+                                             : (OSI_SYNTHETIC_ID_BASE | (uint32_t)g_funcCacheCount);
+
             if (s_diagLogCount < MAX_DIAG_LOGS) {
-                LOG_OSIRIS_DEBUG("SUCCESS: funcId=0x%08x -> '%s' (arity=%d, type=%s[%d], handle=0x%08x)",
-                           funcId, name, arity, osi_func_type_str(type), type, handle);
+                LOG_OSIRIS_DEBUG("SUCCESS: '%s' (arity=%d, type=%s[%d], id=0x%08x, node=%u)",
+                           name, arity, osi_func_type_str(type), type, cacheId, nodeId);
                 s_diagLogCount++;
             }
 
-            osi_func_cache(name, funcId, arity, type);
-            if (handle != 0) {
-                osi_func_cache_set_handle(funcId, handle);
-            }
+            osi_func_cache_append_full(name, cacheId, arity, type, handle,
+                                       funcDef, nodeId, ptypes, arity);
             return 1;
-        } else if (s_diagLogCount < MAX_DIAG_LOGS) {
-            /* Log failure - but don't try to dump memory unsafely */
-            LOG_OSIRIS_DEBUG("Failed to extract name for funcId=0x%08x, funcDef=%p (memory inaccessible or invalid)", funcId, funcDef);
-            s_diagLogCount++;
         }
     }
 
     return 0;
+}
+
+int osi_func_cache_by_id(uint32_t funcId) {
+    if (!s_pfn_pFunctionData || !s_ppOsiFunctionMan) return 0;
+
+    void *funcMan = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)s_ppOsiFunctionMan, &funcMan) || !funcMan) {
+        return 0;
+    }
+
+    void *funcDef = s_pfn_pFunctionData(funcMan, funcId);
+    return osi_func_cache_funcdef(funcDef, funcId);
+}
+
+/* Walk one red-black tree (a hash bucket) iteratively, caching every function.
+ * Returns the number of nodes processed. */
+static int osi_func_walk_tree(void *root) {
+    void *stack[64];
+    int sp = 0;
+    int count = 0;
+    if (root) stack[sp++] = root;
+    while (sp > 0) {
+        void *node = stack[--sp];
+        SafeMemoryInfo ni = safe_memory_check_address((mach_vm_address_t)node);
+        if (!ni.is_valid || !ni.is_readable) continue;
+
+        void *funcDef = NULL;
+        if (safe_memory_read_pointer((mach_vm_address_t)node + TREENODE_VALUE_OFFSET, &funcDef) && funcDef) {
+            if (osi_func_cache_funcdef(funcDef, 0)) count++;
+        }
+
+        if (sp < 62) {
+            void *left = NULL, *right = NULL;
+            if (safe_memory_read_pointer((mach_vm_address_t)node + TREENODE_LEFT_OFFSET, &left) && left)
+                stack[sp++] = left;
+            if (safe_memory_read_pointer((mach_vm_address_t)node + TREENODE_RIGHT_OFFSET, &right) && right)
+                stack[sp++] = right;
+        }
+    }
+    return count;
+}
+
+void osi_func_enumerate_hash(void) {
+    if (!s_ppOsiFunctionMan) return;
+    void *funcMan = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)s_ppOsiFunctionMan, &funcMan) || !funcMan) {
+        LOG_OSIRIS_WARN("enumerate_hash: OsiFunctionMan NULL");
+        return;
+    }
+
+    /* Full rebuild: the name-hash is the authoritative source for both engine and
+     * story functions, and each is keyed once by "name/arity", so resetting first
+     * makes this idempotent (no duplicate story entries on re-run) and lets the
+     * walk append without per-entry dedup. Known-event id mappings live in a
+     * separate table and survive this reset. */
+    osi_func_cache_init();
+    s_diagLogCount = 0;
+
+    int total = 0;
+    for (int i = 0; i < FUNCHASH_NUM_BUCKETS; i++) {
+        mach_vm_address_t bucket = (mach_vm_address_t)funcMan + FUNCHASH_BUCKETS_OFFSET
+                                 + (mach_vm_address_t)i * FUNCHASH_BUCKET_STRIDE;
+        void *root = NULL;
+        if (safe_memory_read_pointer(bucket + FUNCHASH_BUCKET_ROOT, &root) && root) {
+            total += osi_func_walk_tree(root);
+        }
+    }
+    LOG_OSIRIS_INFO("enumerate_hash: walked function name-hash, %d cached (total %d)",
+                    total, g_funcCacheCount);
 }
 
 void osi_func_cache_from_event(uint32_t funcId) {
@@ -654,6 +801,53 @@ uint32_t osi_func_get_handle(const char *name) {
     return 0;
 }
 
+int osi_func_resolve(const char *name, int preferArity, uint8_t *out_arity,
+                     uint8_t *out_type, uint32_t *out_id, uint32_t *out_nodeId) {
+    if (!name) return 0;
+
+    /* Story functions are overloaded by arity (e.g. QRY_StartDialog_Fixed/2,/3,/4),
+     * each a distinct cache entry sharing the name. Prefer the variant whose arity
+     * exactly matches the caller's arg count; else the smallest arity >= it (covers
+     * queries with OUT params, where in-args < total arity); else the first match. */
+    int firstIdx = -1, exactIdx = -1, geIdx = -1;
+    for (int i = 0; i < g_funcCacheCount; i++) {
+        if (strcmp(g_funcCache[i].name, name) != 0) continue;
+        if (firstIdx < 0) firstIdx = i;
+        if (preferArity < 0) continue;
+        uint8_t a = g_funcCache[i].arity;
+        if (a == (uint8_t)preferArity) { exactIdx = i; break; }
+        if (a >= (uint8_t)preferArity && (geIdx < 0 || a < g_funcCache[geIdx].arity)) geIdx = i;
+    }
+    int idx = (exactIdx >= 0) ? exactIdx : (geIdx >= 0 ? geIdx : firstIdx);
+    if (idx < 0) return 0;
+
+    if (out_arity)  *out_arity  = g_funcCache[idx].arity;
+    if (out_type)   *out_type   = g_funcCache[idx].type;
+    if (out_id)     *out_id     = g_funcCache[idx].id;
+    if (out_nodeId) *out_nodeId = g_funcCache[idx].nodeId;
+    return 1;
+}
+
+int osi_func_get_node(const char *name, void **out_funcDef, uint32_t *out_nodeId) {
+    if (!name) return 0;
+
+    int idx = -1;
+    int hash = func_name_hash(name);
+    int16_t h = g_funcNameHashTable[hash];
+    if (h >= 0 && strcmp(g_funcCache[h].name, name) == 0) {
+        idx = h;
+    } else {
+        for (int i = 0; i < g_funcCacheCount; i++) {
+            if (strcmp(g_funcCache[i].name, name) == 0) { idx = i; break; }
+        }
+    }
+    if (idx < 0) return 0;
+
+    if (out_funcDef) *out_funcDef = g_funcCache[idx].funcDef;
+    if (out_nodeId) *out_nodeId = g_funcCache[idx].nodeId;
+    return 1;
+}
+
 void osi_func_update_known_event_id(const char *name, uint32_t funcId) {
     if (!name || funcId == 0) return;
 
@@ -799,11 +993,25 @@ void osi_func_probe_info(const char *name, void (*out)(const char *fmt, ...)) {
     int infoFound = osi_func_get_info(name, &cachedArity, &cachedType);
     uint32_t handle = osi_func_get_handle(name);
 
+    void *cachedFuncDef = NULL;
+    uint32_t cachedNodeId = 0;
+    osi_func_get_node(name, &cachedFuncDef, &cachedNodeId);
+
     out("=== !osi_info %s ===", name);
     out("  funcId: 0x%08x (%s)", funcId, funcId == INVALID_FUNCTION_ID ? "NOT FOUND" : "found");
     out("  arity: %d (from %s)", cachedArity, infoFound ? "known table or cache" : "unknown");
     out("  type: %s[%d]", osi_func_type_str(cachedType), cachedType);
     out("  handle: 0x%08x", handle);
+    out("  nodeId: %u (%s)", cachedNodeId,
+        cachedNodeId ? "story -> rete dispatch" : "engine -> DIV dispatch");
+    out("  funcDef(cached): %p", cachedFuncDef);
+
+    /* Story functions have a synthetic id; pFunctionData can't re-probe them, so
+     * stop here (the cached funcDef above is the live pointer used for dispatch). */
+    if (funcId != INVALID_FUNCTION_ID && (funcId & OSI_SYNTHETIC_ID_BASE)) {
+        out("  [story function: dispatched via rete node, not pFunctionData]");
+        return;
+    }
 
     /* 2. Re-probe the pointer chain from live memory */
     if (funcId == INVALID_FUNCTION_ID) {
@@ -893,5 +1101,51 @@ void osi_func_probe_info(const char *name, void (*out)(const char *fmt, ...)) {
                 out("    PL+0x%02x: 0x%08x (%u)", off, val, val);
             }
         }
+    }
+
+    /* Step 5: Walk the param-list nodes to discover node layout + per-param types.
+     * The list is { VMT@0x00, Head@0x08, Tail@0x10, Count@0x18 }. Each node's
+     * layout (Next offset, TypeId offset/width) is unknown — dump raw bytes plus
+     * interpreted candidates so we can derive it from known functions:
+     *   GetHostCharacter   -> [GUIDSTRING out]
+     *   GetGold            -> [GUIDSTRING in, INTEGER out]
+     *   AddExplorationExperience -> [GUIDSTRING in, INTEGER in]
+     *   GetFlag            -> [GUIDSTRING in, GUIDSTRING in, INTEGER out] */
+    void *headPtr = NULL;
+    void *tailPtr = NULL;
+    safe_memory_read_pointer((mach_vm_address_t)paramListPtr + PARAMLIST_HEAD_OFFSET, &headPtr);
+    safe_memory_read_pointer((mach_vm_address_t)paramListPtr + PARAMLIST_TAIL_OFFSET, &tailPtr);
+    out("  ParamList.Head: %p  Tail: %p", headPtr, tailPtr);
+
+    int walkMax = (paramSize > 0 && paramSize <= 20) ? (int)paramSize + 1 : 8;
+    void *node = headPtr;
+    for (int n = 0; n < walkMax && node; n++) {
+        SafeMemoryInfo ni = safe_memory_check_address((mach_vm_address_t)node);
+        if (!ni.is_valid || !ni.is_readable) {
+            out("    node[%d] %p: NOT READABLE", n, node);
+            break;
+        }
+        uint8_t raw[0x20];
+        if (!safe_memory_read((mach_vm_address_t)node, raw, sizeof(raw))) {
+            out("    node[%d] %p: read failed", n, node);
+            break;
+        }
+        /* Raw hex */
+        char hexline[160];
+        int pos = snprintf(hexline, sizeof(hexline), "    node[%d] %p:", n, node);
+        for (int j = 0; j < 0x20; j++) {
+            pos += snprintf(hexline + pos, sizeof(hexline) - pos, " %02x", raw[j]);
+        }
+        out("%s", hexline);
+        /* Interpreted candidates: ptrs at 0x00/0x08 (Next candidates),
+         * and small-int values at every 4-byte and 2-byte offset (TypeId candidates). */
+        void *p0 = *(void **)(raw + 0x00);
+        void *p8 = *(void **)(raw + 0x08);
+        out("      next?@0x00=%p  ptr@0x08=%p  u16@0x08=%u u16@0x0c=%u u16@0x10=%u u32@0x08=%u u32@0x10=%u",
+            p0, p8,
+            *(uint16_t *)(raw + 0x08), *(uint16_t *)(raw + 0x0c), *(uint16_t *)(raw + 0x10),
+            *(uint32_t *)(raw + 0x08), *(uint32_t *)(raw + 0x10));
+        /* Advance via the most likely Next pointer (offset 0x00). */
+        node = p0;
     }
 }

@@ -220,6 +220,15 @@ static void *orig_RegisterDIVFunctions = NULL;
 // Global pointer to OsiFunctionMan from libOsiris
 static void **g_pOsiFunctionMan = NULL;  // Points to the global _OsiFunctionMan
 
+// Rete network dispatch for story functions (PROC_/QRY_/DB_). Story functions
+// have no DIV handle and are executed through their rete node, resolved from the
+// CReteNodeFactory. _ReteNodeFactory (libOsiris+0x9f338) holds a CReteNodeFactory*
+// laid out { uint32 count@0x00; std::vector<CReteNode*> nodes@0x08 }; a function's
+// node is nodes[Node.Id-1]. The query executor _ExecuteQuery(COsiArgumentDesc*) is
+// virtual at object-vptr+0xc0 for all query node types (RE'd from libOsiris).
+static void **g_pReteNodeFactory = NULL;  // Points to the global _ReteNodeFactory
+static uintptr_t g_libOsirisBase = 0;     // libOsiris load base (for node vtable validation)
+
 // Captured player GUIDs from events (we learn these by observing)
 #define MAX_KNOWN_PLAYERS 8
 static char g_knownPlayerGuids[MAX_KNOWN_PLAYERS][128];
@@ -1141,37 +1150,6 @@ static int lua_osi_dialogrequeststop(lua_State *L) {
 }
 
 /**
- * Osi.QRY_StartDialog_Fixed(resource, character) - Start a dialog
- * Uses real Osiris query when available
- */
-static int lua_osi_qry_startdialog_fixed(lua_State *L) {
-    const char *resource = luaL_optstring(L, 1, NULL);
-    const char *character = luaL_optstring(L, 2, NULL);
-
-    // Try real Osiris query first
-    if (pfn_InternalQuery && resource && character) {
-        uint32_t funcId = osi_func_lookup_id("QRY_StartDialog_Fixed");
-        if (funcId != INVALID_FUNCTION_ID) {
-            OsiArgumentDesc *args = alloc_args(2);
-            if (args) {
-                set_arg_string(&args[0], resource, 0);   // String (resource)
-                set_arg_string(&args[1], character, 1);  // GUID
-                int result = osiris_query_by_id(funcId, args);
-                LOG_LUA_INFO("Osi.QRY_StartDialog_Fixed('%s', '%s') -> %d (via Osiris)",
-                           resource, character, result);
-                lua_pushboolean(L, result);
-                return 1;
-            }
-        }
-    }
-
-    LOG_LUA_INFO("Osi.QRY_StartDialog_Fixed('%s', '%s') -> false (fallback)",
-                resource ? resource : "nil", character ? character : "nil");
-    lua_pushboolean(L, 0);
-    return 1;
-}
-
-/**
  * Check if a GUID looks like a player character
  * Player GUIDs typically start with "S_Player_" in BG3
  */
@@ -1464,18 +1442,18 @@ static int osi_value_to_lua(lua_State *L, OsiArgumentValue *val) {
         case OSI_TYPE_REAL:
             lua_pushnumber(L, val->floatVal);
             return 1;
-        case OSI_TYPE_STRING:
-        case OSI_TYPE_GUIDSTRING: {
-            // An out slot is pre-typed GUIDSTRING before dispatch, but a query
-            // with a non-string out param (e.g. GetFlag's integer result) writes
-            // a non-pointer value here. Never deref a value that isn't a valid
-            // address — guard the read instead of trusting the type.
+        default: {
+            // Everything >= STRING (4) is string-pointer storage: STRING,
+            // GUIDSTRING, and all GUID subtype aliases (CharacterGuid=6,
+            // FlagGuid=16, ...). Read the string defensively — never deref a
+            // value that isn't a valid address (a misclassified slot could hold
+            // a small integer or garbage).
             uintptr_t p = (uintptr_t)val->stringVal;
             if (p == 0) {
                 lua_pushnil(L);
             } else if (p < 0x100000) {
                 // Too low to be a heap/data pointer — it's an integer the engine
-                // wrote into the string slot (e.g. GetFlag 0/1). Return it as one.
+                // wrote into the slot. Return it as one.
                 lua_pushinteger(L, (lua_Integer)p);
             } else if (!safe_memory_check_address((mach_vm_address_t)p).is_readable) {
                 lua_pushnil(L);
@@ -1484,11 +1462,121 @@ static int osi_value_to_lua(lua_State *L, OsiArgumentValue *val) {
             }
             return 1;
         }
-        default:
-            LOG_OSIRIS_DEBUG("Unknown type %d", val->typeId);
-            lua_pushnil(L);
-            return 1;
     }
+}
+
+// Osiris value-type storage class: 1/2/3 are numeric (int/int64/real); every
+// other type (4=STRING, 5=GUIDSTRING, and GUID subtype aliases) is stored as a
+// string pointer.
+static inline int osi_type_is_numeric(uint8_t t) {
+    return t == OSI_TYPE_INTEGER || t == OSI_TYPE_INTEGER64 || t == OSI_TYPE_REAL;
+}
+
+// ============================================================================
+// Story function dispatch via the rete network
+// ============================================================================
+// Story-defined functions (PROC_/QRY_/DB_) have no DIV handle and cannot be
+// dispatched through DivCall/DivQuery. They are executed through their rete node.
+//
+// CReteNodeFactory layout (RE'd from CReteNodeFactory::CreateReteOsiQuery):
+//   { uint32_t count@0x00; std::vector<CReteNode*> nodes@0x08 }
+// where the vector's begin pointer is at factory+0x08. A function's node is
+// nodes[Node.Id - 1] (the first node created gets Id 1). The query executor
+// _ExecuteQuery(COsiArgumentDesc*) is a virtual method at object-vptr + 0xc0,
+// shared by all query node types — so it takes the exact same OsiArgumentDesc
+// chain we already build for DivQuery (typed in slots + typed out slots).
+#define RETE_FACTORY_COUNT_OFFSET       0x00
+#define RETE_FACTORY_VECBEGIN_OFFSET    0x08
+#define RETE_VTABLE_EXECUTEQUERY_OFFSET 0xc0
+// Object vptr values (offsets from libOsiris base) for the known query node
+// classes — used as a safety gate so we only ever invoke _ExecuteQuery on a
+// genuine query node (calling it on, say, a CReteAnd would corrupt state).
+#define RETE_VPTR_OSIQUERY      0x91228   // CReteOsiQuery   (user-defined story queries)
+#define RETE_VPTR_DIVQUERY      0x91148   // CReteDIVQuery   (engine queries)
+#define RETE_VPTR_INTERNALQUERY 0x91308   // CReteInternalQuery (built-in queries)
+
+typedef int (*ReteExecQueryFn)(void *node, OsiArgumentDesc *args);
+
+// Resolve a story function's rete node from its Node.Id via the CReteNodeFactory.
+// Returns NULL (never crashes) if the factory is unavailable, the id is out of
+// range, or any pointer is unreadable.
+static void *osi_get_rete_node(uint32_t nodeId) {
+    if (!g_pReteNodeFactory || nodeId == 0) return NULL;
+
+    void *factory = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)g_pReteNodeFactory, &factory) || !factory)
+        return NULL;
+
+    uint32_t count = 0;
+    if (!safe_memory_read_u32((mach_vm_address_t)factory + RETE_FACTORY_COUNT_OFFSET, &count)
+        || nodeId > count)
+        return NULL;
+
+    void *vecBegin = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)factory + RETE_FACTORY_VECBEGIN_OFFSET, &vecBegin)
+        || !vecBegin)
+        return NULL;
+
+    void *node = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)vecBegin + (mach_vm_address_t)(nodeId - 1) * 8, &node))
+        return NULL;
+    return node;
+}
+
+// If `node` is a known query rete node, return its _ExecuteQuery; else NULL.
+// Validating the vptr against the known query vtables guarantees we never call
+// _ExecuteQuery on a non-query node.
+static ReteExecQueryFn osi_rete_query_executor(void *node) {
+    if (!node || !g_libOsirisBase) return NULL;
+
+    void *vptr = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)node, &vptr) || !vptr) return NULL;
+
+    uintptr_t off = (uintptr_t)vptr - g_libOsirisBase;
+    if (off != RETE_VPTR_OSIQUERY && off != RETE_VPTR_DIVQUERY && off != RETE_VPTR_INTERNALQUERY) {
+        LOG_OSIRIS_WARN("Osi: rete node vptr +0x%lx is not a known query node — not dispatching",
+                        (unsigned long)off);
+        return NULL;
+    }
+
+    void *fn = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)vptr + RETE_VTABLE_EXECUTEQUERY_OFFSET, &fn) || !fn)
+        return NULL;
+    return (ReteExecQueryFn)fn;
+}
+
+// Execute a story query (UserQuery/SysQuery/Database-as-query) through its rete
+// node, pushing its result(s) onto the Lua stack. `args` is the same typed
+// OsiArgumentDesc chain built for DivQuery (in slots filled, out slots typed).
+// Returns the Lua return count, or -1 if the node couldn't be resolved (so the
+// caller can fall back / return nil safely without ever touching DivQuery).
+static int osi_rete_query_dispatch(lua_State *L, const char *funcName, uint32_t nodeId,
+                                   OsiArgumentDesc *args, int numArgs, int allocCount) {
+    void *node = osi_get_rete_node(nodeId);
+    ReteExecQueryFn exec = osi_rete_query_executor(node);
+    if (!exec) {
+        LOG_OSIRIS_DEBUG("Osi.%s: no rete query node (nodeId=%u, node=%p)", funcName, nodeId, node);
+        return -1;
+    }
+
+    BREADCRUMB();
+    int result = exec(node, allocCount > 0 ? args : NULL);
+    LOG_OSIRIS_DEBUG("Osi.%s: rete query returned %d (node=%p, nodeId=%u)",
+                     funcName, result, node, nodeId);
+
+    if (result && allocCount > numArgs) {
+        int returnCount = 0;
+        for (int i = numArgs; i < allocCount; i++) {
+            osi_value_to_lua(L, &args[i].value);
+            returnCount++;
+        }
+        return returnCount;
+    } else if (result) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
 }
 
 /**
@@ -1573,23 +1661,29 @@ static int osi_dynamic_call(lua_State *L) {
         }
     }
 
-    // Look up function ID (native Osiris function)
-    uint32_t funcId = osi_func_lookup_id(funcName);
-    if (funcId == INVALID_FUNCTION_ID) {
+    // Resolve the function arity-aware: story functions are overloaded by arity
+    // (e.g. QRY_StartDialog_Fixed/2,/3,/4 are distinct nodes), so pick the variant
+    // matching the caller's arg count rather than the first by name.
+    int numArgs = lua_gettop(L);
+    uint8_t arity = 0;
+    uint8_t funcType = OSI_FUNC_UNKNOWN;
+    uint32_t funcId = 0;
+    uint32_t nodeId = 0;
+    if (!osi_func_resolve(funcName, numArgs, &arity, &funcType, &funcId, &nodeId)) {
         // Function not yet discovered - return nil gracefully
         LOG_OSIRIS_DEBUG("Osi.%s: Function not found in cache (not yet discovered)", funcName);
         lua_pushnil(L);
         return 1;
     }
 
-    // Get function info to determine type
-    uint8_t arity = 0;
-    uint8_t funcType = OSI_FUNC_UNKNOWN;
-    osi_func_get_info(funcName, &arity, &funcType);
+    // Story functions (PROC_/QRY_/DB_) carry a rete node id (>0) and no DIV
+    // handle; engine functions have nodeId 0. Story functions dispatch through
+    // the rete node — never via DivCall/DivQuery, which would choke on the
+    // synthetic cache id used as funcId.
+    int isStory = (nodeId != 0);
 
-    int numArgs = lua_gettop(L);
-    LOG_OSIRIS_DEBUG("Osi.%s: Called with %d args (funcId=0x%x, type=%s[%d], arity=%d)",
-                funcName, numArgs, funcId, osi_func_type_str(funcType), funcType, arity);
+    LOG_OSIRIS_DEBUG("Osi.%s: Called with %d args (funcId=0x%x, type=%s[%d], arity=%d, node=%u)",
+                funcName, numArgs, funcId, osi_func_type_str(funcType), funcType, arity, nodeId);
 
     // Check if we have any dispatch available (DivFunctions from RegisterDIVFunctions,
     // or InternalQuery as fallback for query-only paths)
@@ -1610,16 +1704,26 @@ static int osi_dynamic_call(lua_State *L) {
         numArgs = arity;
     }
 
-    // Allocate arguments based on clamped arg count.
-    // For queries, the full arity (in+out) is needed — this requires
-    // correct ParamCount from funcDef. See osi_func_enumerate() for offset.
+    // Allocate the full declared arity whenever it's known. The engine walks
+    // exactly `arity` linked arg nodes, so a short list (e.g. SetFlag has arity 4
+    // but is commonly called with 2) makes it deref past the chain into NULL.
+    //  - Queries: trailing slots [numArgs, arity) are OUTPUTS (typed, value zeroed).
+    //  - Calls/Events/Procs: trailing slots are INPUTS the caller omitted; we pad
+    //    them with typed defaults (0 / "") below.
     int allocCount = numArgs;
-    if ((funcType == OSI_FUNC_QUERY || funcType == OSI_FUNC_SYSQUERY ||
-         funcType == OSI_FUNC_USERQUERY) && arity > numArgs) {
+    if (arity > numArgs) {
         allocCount = arity;
-        LOG_OSIRIS_DEBUG("Osi.%s: Query allocated %d slots (luaArgs=%d, arity=%d)",
-                        funcName, allocCount, numArgs, arity);
+        LOG_OSIRIS_DEBUG("Osi.%s: allocated %d slots (luaArgs=%d, arity=%d, type=%s)",
+                        funcName, allocCount, numArgs, arity, osi_func_type_str(funcType));
     }
+
+    // Read the function's declared parameter types (declaration order) from the
+    // Osiris signature. These let us type both input and output arg slots exactly
+    // as the engine expects, instead of guessing from the Lua value or defaulting
+    // every out slot to GUIDSTRING (which broke integer-out queries like GetFlag).
+    // A type of 0 (or implausible value) means "unknown" → fall back to inference.
+    uint8_t ptypes[MAX_OSI_PARAMS];
+    int ptypeCount = osi_func_get_param_types(funcName, ptypes, MAX_OSI_PARAMS);
 
     OsiArgumentDesc *args = NULL;
     if (allocCount > 0) {
@@ -1631,8 +1735,36 @@ static int osi_dynamic_call(lua_State *L) {
         // Convert Lua arguments to Osiris arguments (input slots only)
         for (int i = 0; i < numArgs; i++) {
             int argIdx = i + 1;  // Lua indices start at 1
-            int luaType = lua_type(L, argIdx);
 
+            // Use the declared type when known & plausible; the engine's
+            // GetDataSrcPtr selects the union member from this typeId, so it must
+            // match the value we store.
+            uint8_t declared = (i < ptypeCount && ptypes[i] >= 1 && ptypes[i] <= 40)
+                                   ? ptypes[i] : 0;
+            if (declared != 0) {
+                if (osi_type_is_numeric(declared)) {
+                    if (declared == OSI_TYPE_REAL) {
+                        args[i].value.floatVal = (float)lua_tonumber(L, argIdx);
+                    } else if (declared == OSI_TYPE_INTEGER64) {
+                        args[i].value.int64Val = lua_isboolean(L, argIdx)
+                            ? (lua_toboolean(L, argIdx) ? 1 : 0)
+                            : (int64_t)lua_tointeger(L, argIdx);
+                    } else { // OSI_TYPE_INTEGER
+                        args[i].value.int32Val = lua_isboolean(L, argIdx)
+                            ? (lua_toboolean(L, argIdx) ? 1 : 0)
+                            : (int32_t)lua_tointeger(L, argIdx);
+                    }
+                } else {
+                    // STRING / GUIDSTRING / GUID subtype: string-pointer storage.
+                    const char *str = lua_isstring(L, argIdx) ? lua_tostring(L, argIdx) : "";
+                    args[i].value.stringVal = (char *)str;
+                }
+                args[i].value.typeId = declared;
+                continue;
+            }
+
+            // No declared type — fall back to Lua-value inference (legacy path).
+            int luaType = lua_type(L, argIdx);
             switch (luaType) {
                 case LUA_TSTRING: {
                     const char *str = lua_tostring(L, argIdx);
@@ -1667,17 +1799,25 @@ static int osi_dynamic_call(lua_State *L) {
                 }
             }
         }
-        // Pre-initialize output slot TypeIds for queries.
-        // DivQuery calls COsiArgumentDesc::GetDataSrcPtr() which needs a valid typeId
-        // to return the correct union member pointer. Without this, typeId=0 (NONE) causes
-        // a C++ exception → std::terminate → SIGABRT.
-        // Windows BG3SE reads exact types from Signature->Params (Function.inl:376).
-        // Default to GUIDSTRING (type 5) which is the most common Osiris output type.
-        // TODO: Read actual param types from funcDef->Signature->Params linked list.
-        if (funcType == OSI_FUNC_QUERY || funcType == OSI_FUNC_SYSQUERY ||
-            funcType == OSI_FUNC_USERQUERY) {
-            for (int i = numArgs; i < allocCount; i++) {
-                args[i].value.typeId = OSI_TYPE_GUIDSTRING;
+        // Type the trailing slots [numArgs, allocCount).
+        // DivQuery/DivCall call COsiArgumentDesc::GetDataSrcPtr() which needs a
+        // valid typeId to select the union member. Without this, typeId=0 (NONE)
+        // causes a C++ exception → std::terminate → SIGABRT.
+        //  - Queries: trailing slots are outputs — type only (value stays zeroed,
+        //    so a numeric out reads back as 0; engine overwrites on success).
+        //  - Calls/Events/Procs: trailing slots are inputs the caller omitted —
+        //    type them and leave the zeroed value as the default (0 for numeric,
+        //    NULL/"" for string). alloc_args() already memset the value to 0.
+        int isQuery = (funcType == OSI_FUNC_QUERY || funcType == OSI_FUNC_SYSQUERY ||
+                       funcType == OSI_FUNC_USERQUERY);
+        for (int i = numArgs; i < allocCount; i++) {
+            uint8_t declared = (i < ptypeCount && ptypes[i] >= 1 && ptypes[i] <= 40)
+                                   ? ptypes[i] : 0;
+            args[i].value.typeId = (declared != 0) ? declared : OSI_TYPE_GUIDSTRING;
+            // For non-numeric (string-pointer) inputs we pad, point at "" rather
+            // than NULL so the engine never derefs a null string pointer.
+            if (!isQuery && !osi_type_is_numeric(args[i].value.typeId)) {
+                args[i].value.stringVal = (char *)"";
             }
         }
     }
@@ -1713,6 +1853,45 @@ static int osi_dynamic_call(lua_State *L) {
     }
 
     BREADCRUMB_ID(dispatchHandle);
+
+    // Story functions (PROC_/QRY_/DB_) dispatch through the rete node — never via
+    // DivCall/DivQuery (which can't see them and would choke on the synthetic id).
+    if (isStory) {
+        switch (funcType) {
+            case OSI_FUNC_QUERY:
+            case OSI_FUNC_SYSQUERY:
+            case OSI_FUNC_USERQUERY:
+            case OSI_FUNC_DATABASE: {
+                // A Database function may be a data node or a user-query node; the
+                // executor gate (vptr check) only fires for genuine query nodes, so
+                // a data node safely returns -1 and falls through to nil.
+                int rc = osi_rete_query_dispatch(L, funcName, nodeId, args, numArgs, allocCount);
+                if (rc >= 0) return rc;
+                LOG_OSIRIS_WARN("Osi.%s: story %s node not resolvable as a query",
+                                funcName, osi_func_type_str(funcType));
+                lua_pushnil(L);
+                return 1;
+            }
+            default:
+                // PROC/EVENT/CALL story functions need rete tuple insertion
+                // (CReteNode::Add), not yet implemented. Returning nil keeps the
+                // synthetic id away from DivCall (which would crash).
+                LOG_OSIRIS_WARN("Osi.%s: story %s dispatch not implemented (needs rete tuple insert)",
+                                funcName, osi_func_type_str(funcType));
+                lua_pushnil(L);
+                return 1;
+        }
+    }
+
+    // Safety net: a synthetic story id must never reach DivCall/DivQuery (it would
+    // pass a bogus handle into the engine). If a story function reached here without
+    // a rete node (nodeId 0), bail rather than dispatch.
+    if (dispatchHandle & OSI_SYNTHETIC_ID_BASE) {
+        LOG_OSIRIS_WARN("Osi.%s: no engine handle and no rete node (id=0x%08x) — returning nil",
+                        funcName, dispatchHandle);
+        lua_pushnil(L);
+        return 1;
+    }
 
     switch (funcType) {
         case OSI_FUNC_QUERY:
@@ -1901,8 +2080,9 @@ static void register_osi_namespace(lua_State *L) {
     lua_pushcfunction(L, lua_osi_dialogrequeststop);
     lua_setfield(L, -2, "DialogRequestStop");
 
-    lua_pushcfunction(L, lua_osi_qry_startdialog_fixed);
-    lua_setfield(L, -2, "QRY_StartDialog_Fixed");
+    // QRY_StartDialog_Fixed is a story-defined user query (CReteOsiQuery node), so
+    // it is dispatched through the generic Osi.* path → rete node executor. The old
+    // special-case handler used the DIV query path, which can't reach story queries.
 
     // Pre-register DB_Players using the generic accessor (read-only Get).
     osi_push_db_accessor(L, "DB_Players");
@@ -2467,6 +2647,22 @@ static bool deferred_session_init_tick(void) {
     game_state_on_session_loaded(L);  // LoadSession → Running
     events_fire(L, EVENT_SESSION_LOADED);
     events_fire(L, EVENT_MODULE_RESUME);
+
+    // Re-enumerate Osiris functions now that the save's story is compiled.
+    // The startup enumeration (from the Event hook) runs at the main menu,
+    // before any story exists, so it only captures the engine DIV functions
+    // (SetFlag/GetFlag/...) — never the story's QRY_/PROC_/DB_ functions.
+    // osi_func_enumerate() is idempotent (dedups by funcId), so re-running it
+    // here adds the story functions, making Osi.* able to call story queries/
+    // procs and Osi.DB_* able to query story databases.
+    if (g_pOsiFunctionMan && *g_pOsiFunctionMan) {
+        int before = osi_func_get_cache_count();
+        osi_func_enumerate();        // engine DIV functions
+        osi_func_enumerate_hash();   // + story QRY_/PROC_/DB_ functions (name-hash walk)
+        int after = osi_func_get_cache_count();
+        log_message("[INFO] [Osiris] Re-enumerated after SessionLoaded: %d -> %d functions cached",
+                    before, after);
+    }
 
     // Step 6: Now net hooks can proceed (state is Running)
     net_hooks_request_deferred_init();
@@ -3209,6 +3405,19 @@ static void resolve_osiris_function_pointers(void *osiris) {
         g_pOsiFunctionMan = (void **)(libBase + 0x9f348);
         LOG_OSIRIS_DEBUG("  OsiFunctionMan calculated from base: %p (base=0x%lx)",
                    (void*)g_pOsiFunctionMan, (unsigned long)libBase);
+    }
+
+    // Resolve the rete node factory global + libOsiris base (for story-function
+    // dispatch). _ReteNodeFactory is at libOsiris+0x9f338; pFunctionData anchors
+    // the base (pFunctionData @ +0x2a04c).
+    g_pReteNodeFactory = (void **)dlsym(osiris, "_ReteNodeFactory");
+    if (pfn_pFunctionData) {
+        g_libOsirisBase = (uintptr_t)pfn_pFunctionData - 0x2a04c;
+        if (!g_pReteNodeFactory) {
+            g_pReteNodeFactory = (void **)(g_libOsirisBase + 0x9f338);
+        }
+        LOG_OSIRIS_DEBUG("  ReteNodeFactory global: %p (base=0x%lx)",
+                   (void*)g_pReteNodeFactory, (unsigned long)g_libOsirisBase);
     }
 
     // Update function cache module with new runtime pointers

@@ -114,12 +114,29 @@ typedef struct {
 // Function Cache Entry
 // ============================================================================
 
+// Max params we read/store per function (matches dispatch arity clamp).
+#define MAX_OSI_PARAMS 20
+
 typedef struct {
     char name[128];
     uint8_t arity;
     uint8_t type;  // OsiFunctionType
     uint32_t id;
     uint32_t handle;  // Encoded OsirisFunctionHandle (0 = not yet computed)
+    // Per-parameter Osiris value types in declaration order, read from
+    // funcDef->Signature->Params node list. 0 = unknown/not read.
+    // Types: 1=INTEGER 2=INTEGER64 3=REAL 4=STRING 5=GUIDSTRING and GUID
+    // subtype aliases (6=CharacterGuid, 16=FlagGuid, ...). Subtypes >=4 are
+    // all string-pointer storage; 1/2/3 are numeric storage.
+    uint8_t paramTypes[MAX_OSI_PARAMS];
+    // Story-function dispatch (rete network). Engine DIV functions are called by
+    // `handle` via DivCall/DivQuery; story functions (PROC_/QRY_/DB_) have no DIV
+    // handle and must be dispatched through their rete node instead.
+    //   funcDef = COsiFunctionData* (OsiFunctionDef) for this function.
+    //   nodeId  = OsiFunctionDef.Node.Id (funcDef+0x20). 0 = engine (no node),
+    //             >0 = story; the rete Node* is Nodes->Db.Elements[nodeId-1].
+    void *funcDef;
+    uint32_t nodeId;
 } CachedFunction;
 
 // ============================================================================
@@ -205,6 +222,12 @@ typedef void* (*pFunctionDataFn)(void *funcMan, uint32_t funcId);
 
 #define INVALID_FUNCTION_ID 0xFFFFFFFF
 #define OSI_FUNCTION_TYPE_MASK 0x80000000  // High bit indicates function type
+
+// Synthetic cache-id base for story functions (PROC_/QRY_/DB_). They have no DIV
+// handle, so we assign a unique id with bit 30 set — clear of engine DIV handles
+// (bit 31, 0x8000xxxx) and small primitive ids. Dispatch routes these via the
+// rete node; a synthetic id must NEVER be passed to DivCall/DivQuery.
+#define OSI_SYNTHETIC_ID_BASE 0x40000000u
 
 #ifdef __cplusplus
 }

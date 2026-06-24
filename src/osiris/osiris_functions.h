@@ -19,9 +19,12 @@ extern "C" {
 // Configuration
 // ============================================================================
 
-#define MAX_CACHED_FUNCTIONS 8192
-#define FUNC_HASH_SIZE 16384
-#define FUNC_NAME_HASH_SIZE 16384
+// The full Osiris function name-hash holds ~20k functions (engine + story).
+// Capacity must exceed that; the lookup tables index g_funcCache via int16_t,
+// so MAX_CACHED_FUNCTIONS must stay < 32767.
+#define MAX_CACHED_FUNCTIONS 28000
+#define FUNC_HASH_SIZE 32768
+#define FUNC_NAME_HASH_SIZE 32768
 #define MAX_SEEN_FUNC_IDS 256
 
 // ============================================================================
@@ -56,8 +59,18 @@ void osi_func_cache_set_known_events(KnownEvent *events);
 /**
  * Enumerate all Osiris functions by probing ID ranges.
  * Call this after runtime pointers are set and game is initialized.
+ * NOTE: only finds engine DIV functions (~1300). Use osi_func_enumerate_hash()
+ * after a save's story compiles to also get story QRY_/PROC_/DB_ functions.
  */
 void osi_func_enumerate(void);
+
+/**
+ * Enumerate ALL Osiris functions by walking the COsiFunctionMan name-hash
+ * (1023 red-black-tree buckets). Captures both engine and story-defined
+ * functions (~20k once a save is loaded), so Osi.* can call story PROC_/QRY_
+ * and Osi.DB_* can query story databases. Idempotent (dedups by funcId).
+ */
+void osi_func_enumerate_hash(void);
 
 // ============================================================================
 // Caching
@@ -111,9 +124,42 @@ int osi_func_get_info(const char *name, uint8_t *out_arity, uint8_t *out_type);
 uint32_t osi_func_get_handle(const char *name);
 
 /**
+ * Get the rete-dispatch info for a story function by name.
+ * @param out_funcDef receives the COsiFunctionData* (may be NULL)
+ * @param out_nodeId  receives OsiFunctionDef.Node.Id (0 = engine, >0 = story)
+ * @return 1 if the function is cached, 0 otherwise
+ */
+int osi_func_get_node(const char *name, void **out_funcDef, uint32_t *out_nodeId);
+
+/**
+ * Resolve the best overload variant of `name` for a given argument count.
+ * Story functions are overloaded by arity (each a distinct cache entry); this
+ * picks the variant whose arity matches `preferArity` (exact preferred, else the
+ * smallest arity >= it, else the first by name). Pass preferArity < 0 to take the
+ * first match. Fills any non-NULL outputs. Returns 1 on success, 0 if not cached.
+ */
+int osi_func_resolve(const char *name, int preferArity, uint8_t *out_arity,
+                     uint8_t *out_type, uint32_t *out_id, uint32_t *out_nodeId);
+
+/**
  * Set the encoded handle for a cached function.
  */
 void osi_func_cache_set_handle(uint32_t funcId, uint32_t handle);
+
+/**
+ * Store per-parameter Osiris types (declaration order) for a cached function.
+ * Types are read from funcDef->Signature->Params node list during caching.
+ */
+void osi_func_cache_set_param_types(uint32_t funcId, const uint8_t *types, uint8_t count);
+
+/**
+ * Get per-parameter Osiris types (declaration order) for a function by name.
+ * Fills `out` with up to `max` type bytes. Returns the number written (= arity),
+ * or 0 if the function is unknown. A type of 0 means "unknown/not read".
+ * Types: 1=INTEGER 2=INTEGER64 3=REAL 4=STRING 5=GUIDSTRING (and GUID subtype
+ * aliases >=5, all string-pointer storage).
+ */
+int osi_func_get_param_types(const char *name, uint8_t *out, int max);
 
 /**
  * Probe and dump OsiFunctionDef layout for the first N cached functions.
