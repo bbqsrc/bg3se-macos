@@ -229,6 +229,12 @@ static void **g_pOsiFunctionMan = NULL;  // Points to the global _OsiFunctionMan
 static void **g_pReteNodeFactory = NULL;  // Points to the global _ReteNodeFactory
 static uintptr_t g_libOsirisBase = 0;     // libOsiris load base (for node vtable validation)
 
+// COsipParameterList ctor/dtor — used to fire story Procs/Events/DB-inserts by
+// building a parameter tuple from our COsiArgumentDesc and inserting it into the
+// node via Add(COsipParameterList*) (the same path COsiris::Event uses).
+static void *g_cosipParamListCtor = NULL;  // COsipParameterList::COsipParameterList(COsiArgumentDesc*)
+static void *g_cosipParamListDtor = NULL;  // COsipParameterList::~COsipParameterList()
+
 // Captured player GUIDs from events (we learn these by observing)
 #define MAX_KNOWN_PLAYERS 8
 static char g_knownPlayerGuids[MAX_KNOWN_PLAYERS][128];
@@ -1579,6 +1585,59 @@ static int osi_rete_query_dispatch(lua_State *L, const char *funcName, uint32_t 
     return 1;
 }
 
+// Story Proc/Event/Database-insert nodes are fired by inserting a parameter tuple
+// via the virtual Add(COsipParameterList*) at object-vptr+0x68 (slot 13), shared
+// by the start/fact/event node classes. We build the COsipParameterList from the
+// same typed OsiArgumentDesc chain (its ctor walks NextParam and handles NULL for
+// 0-arity), insert, then destruct — the exact pattern COsiris::Event uses.
+#define RETE_VTABLE_ADD_PARAMLIST_OFFSET 0x68
+#define RETE_VPTR_STARTNODE 0x90c58   // CReteStartNode
+#define RETE_VPTR_FACT      0x90ec8   // CReteFact (databases)
+#define RETE_VPTR_EVENT     0x90f98   // CReteEvent (procs/events)
+
+typedef void (*CosipCtorFn)(void *self, OsiArgumentDesc *args);
+typedef void (*CosipDtorFn)(void *self);
+typedef void (*ReteAddParamListFn)(void *node, void *paramList);
+
+// Insert a tuple into a story Proc/Event/DB node, firing it. Returns 1 if the
+// node was a known insert node and dispatch ran; 0 if not resolvable (caller
+// returns nil). Never crashes on a bad node — gated on the node's vtable.
+static int osi_rete_insert_dispatch(const char *funcName, uint32_t nodeId,
+                                    OsiArgumentDesc *args) {
+    if (!g_cosipParamListCtor || !g_cosipParamListDtor) {
+        LOG_OSIRIS_WARN("Osi.%s: COsipParameterList ctor/dtor unresolved — cannot insert", funcName);
+        return 0;
+    }
+    void *node = osi_get_rete_node(nodeId);
+    if (!node) return 0;
+
+    void *vptr = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)node, &vptr) || !vptr) return 0;
+    uintptr_t off = (uintptr_t)vptr - g_libOsirisBase;
+    if (off != RETE_VPTR_STARTNODE && off != RETE_VPTR_FACT && off != RETE_VPTR_EVENT) {
+        LOG_OSIRIS_WARN("Osi.%s: rete node vptr +0x%lx is not a known insert node — not dispatching",
+                        funcName, (unsigned long)off);
+        return 0;
+    }
+
+    void *addFn = NULL;
+    if (!safe_memory_read_pointer((mach_vm_address_t)vptr + RETE_VTABLE_ADD_PARAMLIST_OFFSET, &addFn) || !addFn)
+        return 0;
+
+    // Over-allocate + zero the COsipParameterList so the ctor never writes past it
+    // (real size is < 0x70). The ctor copies our params into the rete; the dtor
+    // frees its internal storage afterward.
+    uint8_t plBuf[256];
+    memset(plBuf, 0, sizeof(plBuf));
+    ((CosipCtorFn)g_cosipParamListCtor)(plBuf, args);
+    BREADCRUMB();
+    ((ReteAddParamListFn)addFn)(node, plBuf);
+    ((CosipDtorFn)g_cosipParamListDtor)(plBuf);
+    LOG_OSIRIS_DEBUG("Osi.%s: rete insert via node=%p (nodeId=%u, vptr+0x%lx)",
+                     funcName, node, nodeId, (unsigned long)off);
+    return 1;
+}
+
 /**
  * Dynamic Osiris function dispatcher
  * This closure is returned by Osi.__index for unknown function names.
@@ -1860,11 +1919,7 @@ static int osi_dynamic_call(lua_State *L) {
         switch (funcType) {
             case OSI_FUNC_QUERY:
             case OSI_FUNC_SYSQUERY:
-            case OSI_FUNC_USERQUERY:
-            case OSI_FUNC_DATABASE: {
-                // A Database function may be a data node or a user-query node; the
-                // executor gate (vptr check) only fires for genuine query nodes, so
-                // a data node safely returns -1 and falls through to nil.
+            case OSI_FUNC_USERQUERY: {
                 int rc = osi_rete_query_dispatch(L, funcName, nodeId, args, numArgs, allocCount);
                 if (rc >= 0) return rc;
                 LOG_OSIRIS_WARN("Osi.%s: story %s node not resolvable as a query",
@@ -1872,11 +1927,31 @@ static int osi_dynamic_call(lua_State *L) {
                 lua_pushnil(L);
                 return 1;
             }
+            case OSI_FUNC_PROC:
+            case OSI_FUNC_EVENT:
+                // Fire the proc/event by inserting its parameter tuple into the node.
+                if (osi_rete_insert_dispatch(funcName, nodeId, args)) {
+                    lua_pushboolean(L, 1);
+                    return 1;
+                }
+                lua_pushnil(L);
+                return 1;
+            case OSI_FUNC_DATABASE: {
+                // A Database is either a user-query node (read) or a data node
+                // (insert). Try the query path; if the node isn't a query node it
+                // returns -1 without side effects, so fall through to a fact insert.
+                int rc = osi_rete_query_dispatch(L, funcName, nodeId, args, numArgs, allocCount);
+                if (rc >= 0) return rc;
+                if (osi_rete_insert_dispatch(funcName, nodeId, args)) {
+                    lua_pushboolean(L, 1);
+                    return 1;
+                }
+                lua_pushnil(L);
+                return 1;
+            }
             default:
-                // PROC/EVENT/CALL story functions need rete tuple insertion
-                // (CReteNode::Add), not yet implemented. Returning nil keeps the
-                // synthetic id away from DivCall (which would crash).
-                LOG_OSIRIS_WARN("Osi.%s: story %s dispatch not implemented (needs rete tuple insert)",
+                // SysCall/Call story functions (rare) — not dispatched via rete.
+                LOG_OSIRIS_WARN("Osi.%s: story %s dispatch not supported",
                                 funcName, osi_func_type_str(funcType));
                 lua_pushnil(L);
                 return 1;
@@ -3418,6 +3493,12 @@ static void resolve_osiris_function_pointers(void *osiris) {
         }
         LOG_OSIRIS_DEBUG("  ReteNodeFactory global: %p (base=0x%lx)",
                    (void*)g_pReteNodeFactory, (unsigned long)g_libOsirisBase);
+
+        // COsipParameterList ctor/dtor for Proc/Event/DB-insert dispatch.
+        g_cosipParamListCtor = dlsym(osiris, "_ZN18COsipParameterListC2EP16COsiArgumentDesc");
+        if (!g_cosipParamListCtor) g_cosipParamListCtor = (void *)(g_libOsirisBase + 0x40868);
+        g_cosipParamListDtor = dlsym(osiris, "_ZN18COsipParameterListD2Ev");
+        if (!g_cosipParamListDtor) g_cosipParamListDtor = (void *)(g_libOsirisBase + 0x21cbc);
     }
 
     // Update function cache module with new runtime pointers
